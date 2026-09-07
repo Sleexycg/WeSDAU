@@ -1,0 +1,9 @@
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <application>
+        <receiver android:name=".ScoreMonitorDiagnosticsReceiver"
+            android:exported="true" android:permission="android.permission.DUMP" />
+        <receiver android:name=".CourseReminderDiagnosticsReceiver"
+            android:exported="true" android:permission="android.permission.DUMP" />
+        <receiver android:name=".CourseReminderAlarmProbeReceiver" android:exported="false" />
+    </application>
+</manifest>

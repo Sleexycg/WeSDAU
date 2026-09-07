@@ -272,6 +272,9 @@ class MainActivity : ComponentActivity() {
     private var announcementOverlay: LiquidAnnouncementDialogView? = null
     private var pendingAnnouncementInfo: String? = null
     private var liquidToastOverlay: LiquidAppToastView? = null
+    private var courseDragDeleteOverlay: LiquidCourseDeleteTargetView? = null
+    private var courseDragSource: ScheduleGridView? = null
+    private var courseDragCaptureGeneration = 0
     private var liquidToastCapturePending = false
     private var pendingLiquidToast: PendingLiquidToast? = null
     private var liquidToastDismissRunnable: Runnable? = null
@@ -326,6 +329,7 @@ class MainActivity : ComponentActivity() {
     private var bottomNavigation: CampusLiquidBottomTabsView? = null
     private var radialSwitcher: CampusRadialSwitcherView? = null
     private var radialChromeHidden = false
+    private var courseDragChromeOwner: LiquidCourseDeleteTargetView? = null
     private var radialChromeAnimationGeneration = 0
     private val scoreUpdatesEnabled = mutableStateOf(false)
     private var scoresLoading = false
@@ -391,7 +395,8 @@ class MainActivity : ComponentActivity() {
     private data class PendingLiquidToast(
         val message: String,
         val visual: LiquidToastVisual,
-        val durationMillis: Long
+        val durationMillis: Long,
+        val action: LiquidToastAction? = null
     )
     private data class ExamCache(val term: String, val records: List<RemoteExam>)
     private data class EmptyRoomGroup(val title: String, val accent: Int, val rooms: List<String>)
@@ -409,6 +414,7 @@ class MainActivity : ComponentActivity() {
         super.onCreate(state)
         CampusThemeController.initialize(this)
         pushEnabled = getSharedPreferences(PREFS_NAME, MODE_PRIVATE).getBoolean(KEY_PUSH_ENABLED, false)
+        CourseReminderScheduler.restore(this)
         ScoreUpdateScheduler.restoreIfEnabled(this)
         scoreUpdatesEnabled.value = ScoreUpdateScheduler.isEnabled(this)
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
@@ -759,10 +765,11 @@ class MainActivity : ComponentActivity() {
     private fun showLiquidToast(
         message: String,
         visual: LiquidToastVisual,
-        durationMillis: Long = 2_200L
+        durationMillis: Long = 2_200L,
+        action: LiquidToastAction? = null
     ) {
         if (Looper.myLooper() != Looper.getMainLooper()) {
-            runOnUiThread { showLiquidToast(message, visual, durationMillis) }
+            runOnUiThread { showLiquidToast(message, visual, durationMillis, action) }
             return
         }
         if (visual == LiquidToastVisual.LOADING) {
@@ -779,7 +786,7 @@ class MainActivity : ComponentActivity() {
                     if (liquidToastDeferredRunnable !== deferred) return@Runnable
                     liquidToastDeferredRunnable = null
                     liquidToastLoadingStartedAt = 0L
-                    showLiquidToast(message, visual, durationMillis)
+                    showLiquidToast(message, visual, durationMillis, action)
                 }
                 liquidToastDeferredRunnable = deferred
                 pageHost.postDelayed(deferred, remaining)
@@ -787,15 +794,22 @@ class MainActivity : ComponentActivity() {
             }
             liquidToastLoadingStartedAt = 0L
         }
-        val request = PendingLiquidToast(message, visual, durationMillis)
+        val effectiveDuration = if (action != null && durationMillis > 0L && Build.VERSION.SDK_INT >= 29) {
+            getSystemService(android.view.accessibility.AccessibilityManager::class.java)
+                .getRecommendedTimeoutMillis(durationMillis.coerceAtMost(Int.MAX_VALUE.toLong()).toInt(),
+                    android.view.accessibility.AccessibilityManager.FLAG_CONTENT_TEXT or
+                        android.view.accessibility.AccessibilityManager.FLAG_CONTENT_ICONS or
+                        android.view.accessibility.AccessibilityManager.FLAG_CONTENT_CONTROLS).toLong()
+        } else durationMillis
+        val request = PendingLiquidToast(message, visual, effectiveDuration, action)
         pendingLiquidToast = request
         liquidToastDismissRunnable?.let(pageHost::removeCallbacks)
         liquidToastDismissRunnable = null
 
         liquidToastOverlay?.let { overlay ->
             pendingLiquidToast = null
-            overlay.update(message, visual)
-            scheduleLiquidToastDismiss(overlay, durationMillis)
+            overlay.update(message, visual, action)
+            scheduleLiquidToastDismiss(overlay, effectiveDuration)
             return
         }
         if (liquidToastCapturePending) return
@@ -813,7 +827,8 @@ class MainActivity : ComponentActivity() {
                 context = this,
                 pageSnapshot = pageSnapshot,
                 initialMessage = latest.message,
-                initialVisual = latest.visual
+                initialVisual = latest.visual,
+                initialAction = latest.action
             )
             pageHost.addView(overlay, matchParentParams())
             liquidToastOverlay = overlay
@@ -896,7 +911,8 @@ class MainActivity : ComponentActivity() {
         loginUiState.resetPublicSelection()
         onLoginPage = true
         setSystemBars(campusAndroidColors(this).pageBackground)
-        cancelSystemCourseReminder()
+        // Opening the login/term picker isn't disabling reminders or clearing the account.
+        scheduleSystemCourseReminder()
         emptyRoomRequestGeneration++
         emptyRoomsLoading = false
         emptyRoomLoadError = null
@@ -1099,6 +1115,7 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun swapPage(next: View, forward: Boolean, animate: Boolean) {
+        cancelCourseDragDeletion()
         clearLiquidToastImmediately()
         val previous = pageHost.getChildAt(0)
         if (!animate || previous == null) {
@@ -1775,17 +1792,42 @@ class MainActivity : ComponentActivity() {
     private fun setRadialChromeHidden(hidden: Boolean) {
         if (radialChromeHidden == hidden) return
         radialChromeHidden = hidden
+        updateBottomChromeVisibility()
+    }
+
+    private fun hideChromeForCourseDrag(owner: LiquidCourseDeleteTargetView) {
+        courseDragChromeOwner = owner
+        // The version label is closer to the edge than the card's inset. Hide it
+        // immediately so its final digit cannot peek through the right margin.
+        updateBottomChromeVisibility(animate = false)
+    }
+
+    private fun restoreChromeAfterCourseDrag(owner: LiquidCourseDeleteTargetView) {
+        if (courseDragChromeOwner !== owner) return
+        courseDragChromeOwner = null
+        updateBottomChromeVisibility()
+    }
+
+    private fun updateBottomChromeVisibility(animate: Boolean = true) {
+        val hidden = radialChromeHidden || courseDragChromeOwner != null
         val generation = ++radialChromeAnimationGeneration
         val targets = listOfNotNull(bottomNavigation, scheduleVersion)
         targets.forEach { target ->
             target.animate().cancel()
+            if (!animate) {
+                target.animate().withEndAction(null)
+                target.alpha = if (hidden) 0f else 1f
+                target.translationY = 0f
+                target.visibility = if (hidden) View.INVISIBLE else View.VISIBLE
+                return@forEach
+            }
             if (hidden) {
                 target.animate()
                     .alpha(0f)
                     .translationY(dp(10).toFloat())
                     .setDuration(135L)
                     .withEndAction {
-                        if (radialChromeHidden &&
+                        if ((radialChromeHidden || courseDragChromeOwner != null) &&
                             generation == radialChromeAnimationGeneration
                         ) {
                             target.visibility = View.INVISIBLE
@@ -1830,6 +1872,7 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun showMainSection(index: Int) {
+        cancelCourseDragDeletion()
         bottomNavigation?.setSelectedIndex(index)
         if (index == currentMainSection) {
             if (index == 0) jumpToCurrentWeek()
@@ -6201,35 +6244,6 @@ class MainActivity : ComponentActivity() {
         }.start()
     }
 
-    private fun nextCourseForNow(): Course? {
-        val courses = loadCourseCache()
-        val actualWeek = weekForTerm(selectedTerm())
-        if (actualWeek <= 0) return firstCourseForOpening(courses)
-        val now = Calendar.getInstance()
-        val today = (now.get(Calendar.DAY_OF_WEEK) + 5) % 7
-        val minute = now.get(Calendar.HOUR_OF_DAY) * 60 + now.get(Calendar.MINUTE)
-        val starts = currentStartMinutes()
-        val next = courses.filter { courseVisibleInWeek(it, actualWeek) }
-            .mapNotNull { course ->
-                val dayDelta = (course.day - today + 7) % 7
-                val courseDate = (now.clone() as Calendar).apply {
-                    add(Calendar.DAY_OF_MONTH, dayDelta)
-                }
-                if (CampusHolidayCalendar.isHoliday(courseDate)) return@mapNotNull null
-                Triple(dayDelta, starts[course.startSlot], course)
-            }
-            .filter { it.first > 0 || it.second > minute }
-            .minWithOrNull(compareBy<Triple<Int, Int, Course>> { it.first }.thenBy { it.second })
-            ?.third
-        return next ?: firstCourseForOpening(courses)
-    }
-
-    private fun firstCourseForOpening(courses: List<Course>): Course? {
-        return courses.filter { courseVisibleInWeek(it, 1) }
-            .minWithOrNull(compareBy<Course> { it.day }.thenBy { it.startSlot })
-            ?: courses.minWithOrNull(compareBy<Course> { it.day }.thenBy { it.startSlot })
-    }
-
     private fun courseVisibleInWeek(course: Course, week: Int): Boolean =
         CourseWeekRule.isVisible(course.weeks, week)
 
@@ -6260,10 +6274,10 @@ class MainActivity : ComponentActivity() {
     private fun currentStartMinutes(): IntArray = ScheduleTimePolicy.startMinutes(scheduleMode)
 
     private fun togglePushNotifications() {
+        pushEnabled = CourseReminderScheduler.isEnabled(this)
         if (pushEnabled) {
             pushEnabled = false
-            getSharedPreferences(PREFS_NAME, MODE_PRIVATE).edit().putBoolean(KEY_PUSH_ENABLED, false).apply()
-            cancelSystemCourseReminder()
+            CourseReminderScheduler.disable(this)
             showLiquidToast(
                 message = "课程提醒已关闭",
                 visual = LiquidToastVisual.BELL_OFF,
@@ -6281,13 +6295,19 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun continueEnablingPushNotifications() {
+        CourseNotification.blockedReason(this)?.let { reason ->
+            showLiquidToast(message = reason, visual = LiquidToastVisual.BELL_OFF, durationMillis = 2_800L)
+            runCatching {
+                startActivity(Intent(Settings.ACTION_CHANNEL_NOTIFICATION_SETTINGS).apply {
+                    putExtra(Settings.EXTRA_APP_PACKAGE, packageName)
+                    putExtra(Settings.EXTRA_CHANNEL_ID, CourseNotification.CHANNEL_ID)
+                })
+            }
+            return
+        }
         if (!canScheduleExactCourseReminders()) {
             pushEnabled = false
-            getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
-                .edit()
-                .putBoolean(KEY_PUSH_ENABLED, false)
-                .apply()
-            cancelSystemCourseReminder()
+            CourseReminderScheduler.disable(this)
             pendingExactAlarmEnable = true
             showLiquidToast(
                 message = "请授予“闹钟和提醒”权限",
@@ -6301,15 +6321,16 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun enablePushNotifications() {
-        pushEnabled = true
-        getSharedPreferences(PREFS_NAME, MODE_PRIVATE).edit().putBoolean(KEY_PUSH_ENABLED, true).apply()
+        val result = CourseReminderScheduler.enable(this)
+        if (result.scheduled) CourseReminderScheduler.showPreview(this)
+        pushEnabled = CourseReminderScheduler.isEnabled(this)
+        actionMenuOverlay?.setPushState(pushEnabled)
+        val error = CourseReminderScheduler.consumePendingError(this)
         showLiquidToast(
-            message = "课程提醒已开启",
-            visual = LiquidToastVisual.BELL_ON,
-            durationMillis = 1_800L
+            message = error ?: result.message,
+            visual = if (error != null) LiquidToastVisual.ERROR else if (pushEnabled) LiquidToastVisual.BELL_ON else LiquidToastVisual.BELL_OFF,
+            durationMillis = 2_800L
         )
-        schedulePushNotifications()
-        nextCourseForNow()?.let { course -> CourseNotification.show(this, course.name, course.room, courseTimeLabel(course)) }
     }
 
     private fun canScheduleExactCourseReminders(): Boolean {
@@ -6348,21 +6369,11 @@ class MainActivity : ComponentActivity() {
 
     private fun schedulePushNotifications() {
         CourseReminderScheduler.scheduleNext(this)
-    }
-
-    private fun courseTimeLabel(course: Course): String {
-        val ranges = ScheduleTimePolicy.displayRanges(scheduleMode)
-        return "${ranges[course.startSlot].first}-${ranges[course.startSlot + course.slotCount - 1].second}"
-    }
-
-    private fun cancelSystemCourseReminder() {
-        if (!::pageHost.isInitialized) return
-        cancelPushAlarmsOnly()
-        CourseNotification.cancel(this)
-    }
-
-    private fun cancelPushAlarmsOnly() {
-        CourseReminderScheduler.cancel(this)
+        pushEnabled = CourseReminderScheduler.isEnabled(this)
+        actionMenuOverlay?.setPushState(pushEnabled)
+        CourseReminderScheduler.consumePendingError(this)?.let { reason ->
+            showLiquidToast(message = reason, visual = LiquidToastVisual.BELL_OFF, durationMillis = 2_800L)
+        }
     }
 
     private fun setScoreUpdateMonitoringEnabled(enabled: Boolean) {
@@ -7091,7 +7102,7 @@ class MainActivity : ComponentActivity() {
 
     private fun notifyCourseDataChanged() {
         CourseWidgetProvider.updateAll(this)
-        CourseReminderScheduler.scheduleNext(this)
+        schedulePushNotifications()
     }
 
     private fun loadCourseCache(): List<Course> {
@@ -7507,6 +7518,10 @@ class MainActivity : ComponentActivity() {
 
     @Deprecated("Use OnBackInvokedDispatcher on newer Android versions")
     override fun onBackPressed() {
+        if (courseDragSource != null) {
+            cancelCourseDragDeletion()
+            return
+        }
         if (forceUpdateActive) return
         if (backgroundEditorOverlay != null) {
             if (backgroundEditorOverlay?.isApplyingBackground() == true) return
@@ -8239,6 +8254,7 @@ class MainActivity : ComponentActivity() {
         private var dayColumnWidth = 0
         private var headerHeight = 0
         private var slotHeight = 0
+        private var deleteTargetOwner: LiquidCourseDeleteTargetView? = null
         private var desiredWidth = 0
         private var desiredHeight = 0
         private var downX = 0f
@@ -8261,6 +8277,10 @@ class MainActivity : ComponentActivity() {
         private val pageSettleInterpolator = PathInterpolator(.18f, .82f, .22f, 1f)
         private val viewConfiguration = ViewConfiguration.get(context)
         private val touchSlop = viewConfiguration.scaledTouchSlop
+        private var courseLongPressRunnable: Runnable? = null
+        private var courseLongPressCandidate: Course? = null
+        private var coursePointerDown = false
+        private var courseLongPressRecognized = false
         private val pageMinimumFlingVelocity = viewConfiguration.scaledMinimumFlingVelocity
         private val pageMaximumFlingVelocity = viewConfiguration.scaledMaximumFlingVelocity
         private var backgroundSamplePageWidth = 0f
@@ -8301,6 +8321,10 @@ class MainActivity : ComponentActivity() {
 
         override fun onTouchEvent(event: MotionEvent): Boolean {
             if (courseRemovalAnimator != null) return true
+            if (event.pointerCount > 1) {
+                cancelCourseLongPress()
+                courseLongPressRecognized = true
+            }
             when (event.actionMasked) {
                 MotionEvent.ACTION_DOWN -> {
                     if (pageAnimator != null) return false
@@ -8308,6 +8332,9 @@ class MainActivity : ComponentActivity() {
                     pageVelocityTracker = VelocityTracker.obtain().also { it.addMovement(event) }
                     downX = event.x; downY = event.y
                     gestureAxis = 0
+                    courseLongPressRecognized = false
+                    coursePointerDown = true
+                    scheduleCourseLongPress(event.x, event.y)
                     // 手指按下时先缓存当前周，把主要绘制成本移出连续拖动帧。
                     prepareSwipeBitmaps(-1)
                     parent?.requestDisallowInterceptTouchEvent(true)
@@ -8317,6 +8344,7 @@ class MainActivity : ComponentActivity() {
                     pageVelocityTracker?.addMovement(event)
                     val dx = event.x - downX; val dy = event.y - downY
                     if (gestureAxis == 0 && (kotlin.math.abs(dx) > touchSlop || kotlin.math.abs(dy) > touchSlop)) {
+                        cancelCourseLongPress()
                         gestureAxis = if (kotlin.math.abs(dx) > kotlin.math.abs(dy) * 1.1f) 1 else 2
                     }
                     if (gestureAxis == 2) {
@@ -8335,6 +8363,7 @@ class MainActivity : ComponentActivity() {
                     return true
                 }
                 MotionEvent.ACTION_UP -> {
+                    cancelCourseLongPress()
                     pageVelocityTracker?.addMovement(event)
                     pageVelocityTracker?.computeCurrentVelocity(1000, pageMaximumFlingVelocity.toFloat())
                     val velocityX = pageVelocityTracker?.xVelocity ?: 0f
@@ -8359,7 +8388,7 @@ class MainActivity : ComponentActivity() {
                         }
                         settleDraggedWeek(delta, velocityX)
                     } else {
-                        if (kotlin.math.abs(dx) <= touchSlop && kotlin.math.abs(dy) <= touchSlop) {
+                        if (!courseLongPressRecognized && kotlin.math.abs(dx) <= touchSlop && kotlin.math.abs(dy) <= touchSlop) {
                             handleScheduleTap(event.x, event.y)
                         }
                         clearSwipeBitmaps()
@@ -8370,8 +8399,17 @@ class MainActivity : ComponentActivity() {
                     return true
                 }
                 MotionEvent.ACTION_CANCEL -> {
+                    // Native startDragAndDrop cancels the original touch stream.
+                    // The active drag is completed by DragEvent, not by this CANCEL.
+                    cancelCourseLongPress()
                     parent?.requestDisallowInterceptTouchEvent(false)
-                    settleDraggedWeek(0, 0f)
+                    if (courseDragSource === this && courseDragDeleteOverlay != null) {
+                        dragOffset = 0f
+                        clearSwipeBitmaps()
+                        invalidate()
+                    } else {
+                        settleDraggedWeek(0, 0f)
+                    }
                     pageVelocityTracker?.recycle()
                     pageVelocityTracker = null
                     gestureAxis = 0
@@ -8382,6 +8420,8 @@ class MainActivity : ComponentActivity() {
         }
 
         fun setWeekIndex(index: Int) {
+            cancelCourseDragDeletion()
+            cancelCourseLongPress()
             finishCourseRemoval()
             pageAnimator?.removeAllListeners()
             pageAnimator?.cancel()
@@ -8393,8 +8433,14 @@ class MainActivity : ComponentActivity() {
             weekIndex = index.coerceIn(minimumWeekIndex, 20)
             invalidate()
         }
-        fun setScheduleMode(mode: ScheduleMode) { clearSwipeBitmaps(); scheduleMode = mode; invalidate() }
+        fun setScheduleMode(mode: ScheduleMode) {
+            cancelCourseDragDeletion()
+            cancelCourseLongPress()
+            clearSwipeBitmaps(); scheduleMode = mode; invalidate()
+        }
         fun setCourses(updated: List<Course>) {
+            cancelCourseDragDeletion()
+            cancelCourseLongPress()
             finishCourseRemoval()
             clearAddCourseSelection(invalidateView = false)
             clearSwipeBitmaps()
@@ -8444,6 +8490,76 @@ class MainActivity : ComponentActivity() {
             coursesAfterRemoval = null
             removingCourse = null
             courseRemovalProgress = 0f
+        }
+
+        private fun scheduleCourseLongPress(x: Float, y: Float) {
+            cancelCourseLongPress()
+            coursePointerDown = true
+            if (viewingPublicSchedule || onLoginPage || currentMainSection != 0) return
+            val course = findCourseAt(x, y) ?: return
+            courseLongPressCandidate = course
+            val callback = Runnable {
+                courseLongPressRunnable = null
+                if (canBeginCourseDrag(course)) {
+                    courseLongPressRecognized = true
+                    beginCourseDragDeletion(this, course)
+                }
+            }
+            courseLongPressRunnable = callback
+            postDelayed(callback, ViewConfiguration.getLongPressTimeout().toLong())
+        }
+
+        fun cancelCourseLongPress() {
+            courseLongPressRunnable?.let(::removeCallbacks)
+            courseLongPressRunnable = null
+            courseLongPressCandidate = null
+            coursePointerDown = false
+        }
+
+        fun canBeginCourseDrag(course: Course): Boolean = isAttachedToWindow && coursePointerDown &&
+            gestureAxis == 0 && pageAnimator == null && courseRemovalAnimator == null &&
+            courseLongPressCandidate?.let { sameCourseRecord(it, course) } == true
+
+        fun courseDeleteZoneHeightFraction(): Float {
+            if (pageHost.height <= 0 || slotHeight <= 0) return .22f
+            val gridLocation = IntArray(2)
+            val hostLocation = IntArray(2)
+            getLocationInWindow(gridLocation)
+            pageHost.getLocationInWindow(hostLocation)
+            // Align to the start of period 9, not through its number or time lines.
+            // Use actual grid coordinates to account for scrolling and screen size.
+            val eveningTop = gridLocation[1] - hostLocation[1] + headerHeight + 8 * slotHeight
+            val topFraction = minOf(.78f, eveningTop.toFloat() / pageHost.height).coerceAtLeast(.5f)
+            return 1f - topFraction
+        }
+
+        fun showCourseDeleteTarget(owner: LiquidCourseDeleteTargetView) {
+            deleteTargetOwner = owner
+            clearSwipeBitmaps()
+            invalidate()
+        }
+
+        fun hideCourseDeleteTarget(owner: LiquidCourseDeleteTargetView) {
+            // A finishing old gesture must not restore labels beneath a newer card.
+            if (deleteTargetOwner !== owner) return
+            deleteTargetOwner = null
+            clearSwipeBitmaps()
+            invalidate()
+        }
+
+        fun courseDragPreview(course: Course): CourseDragPreview? {
+            val placement = buildCoursePlacements(courses.filter { courseVisibleOnDisplayedSchedule(it, weekIndex) })
+                .firstOrNull { sameCourseRecord(it.course, course) } ?: return null
+            val bounds = courseCardBounds(course, placement.column, placement.columnCount)
+            val inset = dp(3f)
+            val bitmap = Bitmap.createBitmap(kotlin.math.ceil(bounds.width()).toInt() + inset * 2,
+                kotlin.math.ceil(bounds.height()).toInt() + inset * 2, Bitmap.Config.ARGB_8888)
+            Canvas(bitmap).apply {
+                translate(inset - bounds.left, inset - bounds.top)
+                drawCourse(this, course, placement.column, placement.columnCount)
+            }
+            return CourseDragPreview(bitmap, android.graphics.Point(
+                (downX - bounds.left + inset).roundToInt(), (downY - bounds.top + inset).roundToInt()))
         }
         fun refreshTextPalette() { clearSwipeBitmaps(); invalidate() }
 
@@ -9118,6 +9234,8 @@ class MainActivity : ComponentActivity() {
         }
 
         override fun onDetachedFromWindow() {
+            cancelCourseLongPress()
+            if (courseDragSource === this) cancelCourseDragDeletion()
             releaseTransientCaches()
             super.onDetachedFromWindow()
         }
@@ -9188,6 +9306,9 @@ class MainActivity : ComponentActivity() {
         private fun drawTimes(canvas: Canvas) {
             val times = if (scheduleMode == ScheduleMode.SPRING) springTimes else summerTimes
             for (slot in 0..9) {
+                // These labels belong behind the deletion card, not in its inset or
+                // transparent corners. Only the drag presentation is changed.
+                if (deleteTargetOwner != null && slot >= 8) continue
                 val top = headerHeight + slot * slotHeight
                 val center = timeColumnWidth / 2f
                 val slotLabel = (slot + 1).toString()
@@ -9234,7 +9355,7 @@ class MainActivity : ComponentActivity() {
             return if (measured > maxWidth && measured > 0f) desiredSize * maxWidth / measured else desiredSize
         }
 
-        private fun drawCourse(canvas: Canvas, course: Course, column: Int = 0, columnCount: Int = 1) {
+        private fun courseCardBounds(course: Course, column: Int = 0, columnCount: Int = 1, out: RectF = RectF()): RectF {
             val dayLeft = timeColumnWidth + course.day * dayColumnWidth
             val horizontalGap = if (columnCount > 1) dp(2f).toFloat() else 0f
             val availableWidth = dayColumnWidth - dp(4f).toFloat()
@@ -9244,7 +9365,16 @@ class MainActivity : ComponentActivity() {
             val top = headerHeight + course.startSlot * slotHeight + dp(2f)
             val right = left + courseWidth
             val bottom = headerHeight + (course.startSlot + course.slotCount) * slotHeight - dp(2f)
-            rect.set(left.toFloat(), top.toFloat(), right.toFloat(), bottom.toFloat())
+            out.set(left.toFloat(), top.toFloat(), right.toFloat(), bottom.toFloat())
+            return out
+        }
+
+        private fun drawCourse(canvas: Canvas, course: Course, column: Int = 0, columnCount: Int = 1) {
+            courseCardBounds(course, column, columnCount, rect)
+            val left = rect.left
+            val top = rect.top
+            val right = rect.right
+            val bottom = rect.bottom
             val removalProgress = if (removingCourse?.let { sameCourseRecord(it, course) } == true) {
                 courseRemovalProgress.coerceIn(0f, 1f)
             } else 0f
@@ -9311,17 +9441,8 @@ class MainActivity : ComponentActivity() {
                 courseVisibleOnDisplayedSchedule(it, weekIndex)
             })
                 .firstOrNull { placement ->
-                val course = placement.course
-                val dayLeft = timeColumnWidth + course.day * dayColumnWidth
-                val horizontalGap = if (placement.columnCount > 1) dp(2f).toFloat() else 0f
-                val availableWidth = dayColumnWidth - dp(4f).toFloat()
-                val courseWidth = (availableWidth - horizontalGap * (placement.columnCount - 1)) /
-                    placement.columnCount.coerceAtLeast(1)
-                val left = dayLeft + dp(2f) + placement.column * (courseWidth + horizontalGap)
-                val top = headerHeight + course.startSlot * slotHeight + dp(2f)
-                val right = left + courseWidth
-                val bottom = headerHeight + (course.startSlot + course.slotCount) * slotHeight - dp(2f)
-                x in left.toFloat()..right.toFloat() && y in top.toFloat()..bottom.toFloat()
+                val bounds = courseCardBounds(placement.course, placement.column, placement.columnCount)
+                x in bounds.left..bounds.right && y in bounds.top..bounds.bottom
             }?.course
         }
 
@@ -9557,6 +9678,82 @@ class MainActivity : ComponentActivity() {
         return "@$room"
     }
 
+    private fun beginCourseDragDeletion(grid: ScheduleGridView, course: Course) {
+        if (courseDragSource != null || viewingPublicSchedule || detailOverlay != null) return
+        val account = getSharedPreferences(PREFS_NAME, MODE_PRIVATE).getString(KEY_ACCOUNT, "").orEmpty()
+        val term = selectedTerm()
+        val generation = ++courseDragCaptureGeneration
+        courseDragSource = grid
+        captureUpdateBackdrop { snapshot ->
+            if (generation != courseDragCaptureGeneration || !grid.canBeginCourseDrag(course) ||
+                isFinishing || isDestroyed || onLoginPage || viewingPublicSchedule ||
+                currentMainSection != 0 || scheduleGrid !== grid || !isActiveAcademicSession(account, term)) {
+                snapshot?.takeUnless(Bitmap::isRecycled)?.recycle()
+                if (generation == courseDragCaptureGeneration) courseDragSource = null
+                return@captureUpdateBackdrop
+            }
+            val preview = grid.courseDragPreview(course)
+            if (preview == null) {
+                snapshot?.takeUnless(Bitmap::isRecycled)?.recycle()
+                courseDragSource = null
+                return@captureUpdateBackdrop
+            }
+            lateinit var overlay: LiquidCourseDeleteTargetView
+            overlay = LiquidCourseDeleteTargetView(this, snapshot, preview,
+                zoneHeightFraction = grid.courseDeleteZoneHeightFraction(),
+                onDelete = {
+                    val valid = courseDragDeleteOverlay === overlay && !viewingPublicSchedule && !onLoginPage &&
+                        currentMainSection == 0 && scheduleGrid === grid && isActiveAcademicSession(account, term) &&
+                        loadCourseCache().any { sameCourseRecord(it, course) }
+                    if (valid) deleteCourseFromCache(course)
+                    valid
+                },
+                onFinished = { finishCourseDragDeletion(overlay) })
+            courseDragDeleteOverlay = overlay
+            pageHost.addView(overlay, matchParentParams())
+            grid.showCourseDeleteTarget(overlay)
+            hideChromeForCourseDrag(overlay)
+            // Native drag events remain within this window (no GLOBAL flag) and
+            // continue even when the finger leaves the scrollable timetable.
+            val started = runCatching {
+                grid.startDragAndDrop(android.content.ClipData.newPlainText("课程", ""),
+                    overlay.shadowBuilder, overlay, 0)
+            }.getOrDefault(false)
+            if (started) grid.performHapticFeedback(HapticFeedbackConstants.LONG_PRESS)
+            else finishCourseDragDeletion(overlay)
+        }
+    }
+
+    private fun finishCourseDragDeletion(overlay: LiquidCourseDeleteTargetView) {
+        val source = courseDragSource
+        if (courseDragDeleteOverlay === overlay) {
+            courseDragDeleteOverlay = null
+            courseDragSource?.cancelCourseLongPress()
+            courseDragSource = null
+        }
+        overlay.dismiss {
+            pageHost.removeView(overlay)
+            source?.hideCourseDeleteTarget(overlay)
+            restoreChromeAfterCourseDrag(overlay)
+        }
+    }
+
+    private fun cancelCourseDragDeletion() {
+        courseDragCaptureGeneration++
+        scheduleGrid?.cancelCourseLongPress()
+        val source = courseDragSource
+        val overlay = courseDragDeleteOverlay
+        courseDragSource = null
+        courseDragDeleteOverlay = null
+        source?.cancelCourseLongPress()
+        overlay?.dismiss {
+            pageHost.removeView(overlay)
+            source?.hideCourseDeleteTarget(overlay)
+            restoreChromeAfterCourseDrag(overlay)
+        }
+        if (overlay != null) source?.cancelDragAndDrop()
+    }
+
     private fun showCourseDetails(course: Course) {
         if (detailOverlay != null || courseDialogCapturePending) return
         courseDialogCapturePending = true
@@ -9743,11 +9940,36 @@ class MainActivity : ComponentActivity() {
 
     private fun deleteCourseFromCache(course: Course) {
         if (viewingPublicSchedule) return
+        val account = getSharedPreferences(PREFS_NAME, MODE_PRIVATE).getString(KEY_ACCOUNT, "").orEmpty()
+        val term = selectedTerm()
         val source = if (course.isCustom) loadCustomCourseCache() else loadImportedCourseCache()
-        val updated = source.filterNot { current -> sameCourseRecord(current, course) }
-        val recolored = recolorCourses(updated)
+        val deletion = CourseDeletionUndo.capture(source) { sameCourseRecord(it, course) }
+        if (!deletion.hasRemovedCourses) return
+        val recolored = recolorCourses(deletion.remaining)
         if (course.isCustom) saveCustomCourseCache(recolored) else saveCourseCache(recolored)
         scheduleGrid?.animateCourseRemoval(course, loadCourseCache())
+        var restored = false
+        showLiquidToast(
+            message = "${course.name}已删除",
+            visual = LiquidToastVisual.SUCCESS,
+            durationMillis = 5_000L,
+            action = LiquidToastAction("撤回") undo@{
+                if (restored) return@undo
+                // Page changes normally dismiss the toast. Also guard delayed taps
+                // so a deletion from one account/term cannot enter another cache.
+                if (viewingPublicSchedule || !isActiveAcademicSession(account, term)) {
+                    showLiquidToast("课表已切换，无法撤回本次删除", LiquidToastVisual.ERROR)
+                    return@undo
+                }
+                restored = true
+                val latest = if (course.isCustom) loadCustomCourseCache() else loadImportedCourseCache()
+                val recovered = recolorCourses(deletion.restoreInto(latest, ::sameCourseRecord))
+                if (course.isCustom) saveCustomCourseCache(recovered) else saveCourseCache(recovered)
+                // setCourses also cancels an unfinished removal animation.
+                scheduleGrid?.setCourses(loadCourseCache())
+                showLiquidToast("已撤回删除", LiquidToastVisual.SUCCESS)
+            }
+        )
     }
 
     private fun sameCourseRecord(first: Course, second: Course): Boolean =
@@ -9813,6 +10035,7 @@ class MainActivity : ComponentActivity() {
     }
 
     override fun onStop() {
+        cancelCourseDragDeletion()
         if (scheduleDateReceiverRegistered) {
             unregisterReceiver(scheduleDateReceiver)
             scheduleDateReceiverRegistered = false
@@ -9872,11 +10095,7 @@ class MainActivity : ComponentActivity() {
                 enablePushNotifications()
             } else {
                 pushEnabled = false
-                getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
-                    .edit()
-                    .putBoolean(KEY_PUSH_ENABLED, false)
-                    .apply()
-                cancelSystemCourseReminder()
+                CourseReminderScheduler.disable(this)
                 showLiquidToast(
                     message = "未获得闹钟权限，课程提醒无法开启",
                     visual = LiquidToastVisual.BELL_OFF,
@@ -9884,26 +10103,9 @@ class MainActivity : ComponentActivity() {
                 )
             }
             actionMenuOverlay?.setPushState(pushEnabled)
-        } else if (pushEnabled && !canScheduleExactCourseReminders()) {
-            pushEnabled = false
-            getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
-                .edit()
-                .putBoolean(KEY_PUSH_ENABLED, false)
-                .apply()
-            cancelSystemCourseReminder()
-            actionMenuOverlay?.setPushState(false)
         }
-        if (
-            pushEnabled &&
-            canScheduleExactCourseReminders() &&
-            (
-                Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU ||
-                    checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) ==
-                    PackageManager.PERMISSION_GRANTED
-                )
-        ) {
-            scheduleSystemCourseReminder()
-        }
+        // Also reconcile channel/global notification restrictions and background failures.
+        scheduleSystemCourseReminder()
     }
 
     override fun onWindowFocusChanged(hasFocus: Boolean) {

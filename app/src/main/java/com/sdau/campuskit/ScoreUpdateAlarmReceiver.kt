@@ -3,7 +3,6 @@ package com.sdau.campuskit
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
-import androidx.core.content.ContextCompat
 
 class ScoreUpdateAlarmReceiver : BroadcastReceiver() {
     override fun onReceive(context: Context, intent: Intent) {
@@ -15,11 +14,9 @@ class ScoreUpdateAlarmReceiver : BroadcastReceiver() {
                 pendingResult.finish()
                 return
             }
-            enqueueOperation.result.addListener(
-                { pendingResult.finish() },
-                ContextCompat.getMainExecutor(context)
-            )
-        } catch (_: Exception) {
+            enqueueOperation.whenComplete { _, _ -> pendingResult.finish() }
+        } catch (error: Exception) {
+            ScoreUpdateDiagnostics.record(context, "receiver_failed", error.javaClass.simpleName)
             pendingResult.finish()
         }
     }

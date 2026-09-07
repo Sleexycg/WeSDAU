@@ -20,7 +20,7 @@ import androidx.work.ExistingWorkPolicy
 import androidx.work.ForegroundInfo
 import androidx.work.NetworkType
 import androidx.work.OneTimeWorkRequestBuilder
-import androidx.work.Operation
+import androidx.work.WorkInfo
 import androidx.work.OutOfQuotaPolicy
 import androidx.work.PeriodicWorkRequestBuilder
 import androidx.work.WorkManager
@@ -33,6 +33,10 @@ import java.io.IOException
 import java.security.MessageDigest
 import java.util.Calendar
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.CompletableFuture
+import java.util.concurrent.Executors
+import android.provider.Settings
+import android.util.Log
 
 /**
  * Keeps one monotonic score-record snapshot per account and term. The snapshot only
@@ -48,9 +52,13 @@ internal class ScoreUpdateWorker(
 
     override suspend fun doWork(): Result {
         if (!ScoreUpdateScheduler.isEnabled(applicationContext)) return Result.success()
-
+        val session = ScoreUpdateScheduler.session(applicationContext)
+        ScoreUpdateDiagnostics.record(applicationContext, "worker_started", "attempt=$runAttemptCount")
         val credentials = ScoreUpdateScheduler.credentials(applicationContext)
-            ?: return Result.success()
+            ?: run {
+                ScoreUpdateDiagnostics.record(applicationContext, "query_failed", "missing_credentials")
+                return Result.failure()
+            }
         // The monitor is deliberately independent from the term currently viewed in UI.
         val term = ScoreUpdateScheduler.latestTermForAccount(credentials.first)
 
@@ -61,6 +69,12 @@ internal class ScoreUpdateWorker(
                     password = credentials.second,
                     term = term
                 )
+            }
+            // A request already in flight must not publish after the user disables
+            // monitoring, re-enables it, or switches to a different login.
+            if (!ScoreUpdateScheduler.isCurrentSession(applicationContext, session, credentials)) {
+                ScoreUpdateDiagnostics.record(applicationContext, "query_discarded", "session_changed")
+                return Result.success()
             }
             val current = records.mapTo(linkedSetOf()) { record ->
                 record.scoreRecordId.trim().ifBlank {
@@ -104,9 +118,13 @@ internal class ScoreUpdateWorker(
             )
             Result.success()
         } catch (error: CancellationException) {
+            ScoreUpdateDiagnostics.record(applicationContext, "worker_cancelled", "attempt=$runAttemptCount")
             throw error
         } catch (error: Exception) {
-            if (error.isTransientScoreCheckFailure()) Result.retry() else Result.failure()
+            val retry = error.isTransientScoreCheckFailure()
+            ScoreUpdateDiagnostics.record(applicationContext, "query_failed",
+                "${error.javaClass.simpleName}; retry=$retry; attempt=$runAttemptCount")
+            if (retry) Result.retry() else Result.failure()
         }
     }
 }
@@ -121,8 +139,28 @@ internal class ScoreUpdateWatchdogWorker(
     params: WorkerParameters
 ) : CoroutineWorker(appContext, params) {
     override suspend fun doWork(): Result {
-        ScoreUpdateScheduler.runWatchdog(applicationContext)
-        return Result.success()
+        return withContext(Dispatchers.IO) {
+            if (ScoreUpdateScheduler.runWatchdog(applicationContext)) Result.success() else Result.retry()
+        }
+    }
+}
+
+/** A failed alarm registration is recoverable; never turn off the user's switch. */
+internal class ScoreUpdateRepairWorker(context: Context, params: WorkerParameters) : CoroutineWorker(context, params) {
+    override suspend fun doWork(): Result = withContext(Dispatchers.IO) {
+        if (ScoreUpdateScheduler.runWatchdog(applicationContext)) Result.success() else Result.retry()
+    }
+}
+
+/** Bounded, local diagnostics. Never persist credentials, score details or server response bodies. */
+internal object ScoreUpdateDiagnostics {
+    fun record(context: Context, event: String, detail: String = "") {
+        context.getSharedPreferences("score_update_diagnostics", Context.MODE_PRIVATE).edit()
+            .putLong("${event}_at", System.currentTimeMillis())
+            .putString("${event}_detail", detail)
+            .putString("last_event", event)
+            .apply()
+        Log.i("ScoreUpdateMonitor", "$event $detail")
     }
 }
 
@@ -155,16 +193,27 @@ internal object ScoreUpdateScheduler {
     private const val KEY_PUBLISHED_COUNT = "score_update_monitor_published_count"
     private const val KEY_LAST_PUBLISHED_AT = "score_update_monitor_last_published_at"
     private const val KEY_NEXT_ALARM_AT = "score_update_monitor_next_alarm_at"
+    private const val KEY_NEXT_ALARM_ELAPSED = "score_update_monitor_next_alarm_elapsed"
+    private const val KEY_ALARM_BOOT = "score_update_monitor_alarm_boot"
+    private const val KEY_SESSION = "score_update_monitor_session"
     private const val CHECK_WORK = "score_update_monitor_check"
     private const val WATCHDOG_WORK = "score_update_monitor_watchdog"
+    private const val REPAIR_WORK = "score_update_monitor_repair"
+    private const val EXPEDITED_TAG = "score_update_expedited_v2"
     private const val LEGACY_INITIAL_WORK = "score_update_monitor_initial"
     private const val LEGACY_PERIODIC_WORK = "score_update_monitor_periodic"
     private const val ALARM_REQUEST_CODE = 4203
     private const val CHECK_INTERVAL_MILLIS = 30L * 60L * 1_000L
     private const val WATCHDOG_INTERVAL_HOURS = 6L
     private const val SUCCESS_STALE_MILLIS = 90L * 60L * 1_000L
-    private const val ALARM_STALE_TOLERANCE_MILLIS = 5_000L
     private const val FOREGROUND_CATCH_UP_MILLIS = 45L * 60L * 1_000L
+    private val enqueueExecutor = Executors.newSingleThreadExecutor()
+
+    fun session(context: Context): String = context.getSharedPreferences(APP_PREFS, Context.MODE_PRIVATE)
+        .getString(KEY_SESSION, "").orEmpty()
+
+    fun isCurrentSession(context: Context, session: String, credentials: Pair<String, String>): Boolean =
+        isEnabled(context) && session(context) == session && credentials(context) == credentials
 
     private val connectedConstraints = Constraints.Builder()
         .setRequiredNetworkType(NetworkType.CONNECTED)
@@ -203,6 +252,7 @@ internal object ScoreUpdateScheduler {
                 if (publishedChanged) putLong(KEY_LAST_PUBLISHED_AT, checkedAt)
             }
             .apply()
+        ScoreUpdateDiagnostics.record(context, "query_succeeded")
     }
 
     fun credentials(context: Context): Pair<String, String>? {
@@ -212,6 +262,7 @@ internal object ScoreUpdateScheduler {
         return if (account.isBlank() || password.isBlank()) null else account to password
     }
 
+    @Synchronized
     fun enable(context: Context): Boolean {
         val appContext = context.applicationContext
         if (!canScheduleExactAlarms(appContext)) {
@@ -221,37 +272,41 @@ internal object ScoreUpdateScheduler {
         appContext.getSharedPreferences(APP_PREFS, Context.MODE_PRIVATE)
             .edit()
             .putBoolean(KEY_ENABLED, true)
+            .putString(KEY_SESSION, java.util.UUID.randomUUID().toString())
             .apply()
         credentials(appContext)?.let { (account, _) ->
             ScoreUpdateSnapshotStore.clear(appContext, account, latestTermForAccount(account))
         }
         cancelLegacyWork(appContext)
-        if (!scheduleNextAlarm(appContext)) {
-            disable(appContext)
-            return false
-        }
         scheduleWatchdog(appContext)
-        enqueueCheck(appContext)
+        if (!scheduleNextAlarm(appContext)) scheduleRepair(appContext)
+        enqueueCheck(appContext, "enable")
         return true
     }
 
+    @Synchronized
     fun disable(context: Context) {
         val appContext = context.applicationContext
         appContext.getSharedPreferences(APP_PREFS, Context.MODE_PRIVATE)
             .edit()
             .putBoolean(KEY_ENABLED, false)
+            .putString(KEY_SESSION, java.util.UUID.randomUUID().toString())
             .remove(KEY_NEXT_ALARM_AT)
+            .remove(KEY_NEXT_ALARM_ELAPSED)
+            .remove(KEY_ALARM_BOOT)
             .apply()
         cancelAlarm(appContext)
         WorkManager.getInstance(appContext).apply {
             cancelUniqueWork(CHECK_WORK)
             cancelUniqueWork(WATCHDOG_WORK)
+            cancelUniqueWork(REPAIR_WORK)
             cancelUniqueWork(LEGACY_INITIAL_WORK)
             cancelUniqueWork(LEGACY_PERIODIC_WORK)
         }
     }
 
     /** Restores the one-shot alarm after boot/update and performs a stale foreground catch-up. */
+    @Synchronized
     fun restoreIfEnabled(context: Context, forceAlarm: Boolean = false) {
         val appContext = context.applicationContext
         cancelLegacyWork(appContext)
@@ -264,87 +319,121 @@ internal object ScoreUpdateScheduler {
 
         val preferences = appContext.getSharedPreferences(APP_PREFS, Context.MODE_PRIVATE)
         val now = System.currentTimeMillis()
-        val nextAlarmAt = preferences.getLong(KEY_NEXT_ALARM_AT, 0L)
-        if (
-            forceAlarm ||
-            nextAlarmAt <= now + ALARM_STALE_TOLERANCE_MILLIS
-        ) {
-            if (!scheduleNextAlarm(appContext)) {
-                disable(appContext)
-                return
+        val remaining = alarmRemainingMillis(appContext)
+        val missing = alarmPendingIntent(appContext, PendingIntent.FLAG_NO_CREATE) == null
+        if (forceAlarm || missing || remaining <= 0L) {
+            // Re-register future alarms at their original deadline, including
+            // alarms only a few seconds away. Never postpone them on resume.
+            if (!scheduleNextAlarm(appContext, remaining.takeIf { it > 0L } ?: CHECK_INTERVAL_MILLIS)) {
+                scheduleRepair(appContext)
             }
         }
 
         val lastCheckAt = preferences.getLong(KEY_LAST_CHECK_AT, 0L)
-        if (lastCheckAt == 0L || now - lastCheckAt >= FOREGROUND_CATCH_UP_MILLIS) {
-            enqueueCheck(appContext)
+        if (remaining <= 0L || lastCheckAt == 0L || now - lastCheckAt >= FOREGROUND_CATCH_UP_MILLIS) {
+            enqueueCheck(appContext, "restore")
+        } else {
+            // Upgrade a legacy normal pending request even when no catch-up is due.
+            enqueueCheck(appContext, "migration", onlyExisting = true)
         }
     }
 
-    fun onAlarm(context: Context): Operation? {
+    @Synchronized
+    fun onAlarm(context: Context): CompletableFuture<Unit>? {
         val appContext = context.applicationContext
+        ScoreUpdateDiagnostics.record(appContext, "alarm_received")
         if (!isEnabled(appContext)) return null
         if (!canScheduleExactAlarms(appContext)) {
             disable(appContext)
             return null
         }
         if (!scheduleNextAlarm(appContext)) {
-            disable(appContext)
-            return null
+            scheduleRepair(appContext)
         }
-        return enqueueCheck(appContext, expedited = true)
+        return enqueueCheck(appContext, "alarm")
     }
 
-    fun runWatchdog(context: Context) {
+    fun runWatchdog(context: Context): Boolean {
         val appContext = context.applicationContext
-        if (!isEnabled(appContext)) return
+        if (!isEnabled(appContext)) return true
         if (!canScheduleExactAlarms(appContext)) {
             disable(appContext)
-            return
+            return true
         }
 
         val preferences = appContext.getSharedPreferences(APP_PREFS, Context.MODE_PRIVATE)
         val now = System.currentTimeMillis()
-        val nextAlarmAt = preferences.getLong(KEY_NEXT_ALARM_AT, 0L)
+        val remaining = alarmRemainingMillis(appContext)
         val hasAlarmToken = alarmPendingIntent(
             appContext,
             PendingIntent.FLAG_NO_CREATE
         ) != null
-        if (!hasAlarmToken || nextAlarmAt <= now + ALARM_STALE_TOLERANCE_MILLIS) {
-            if (!scheduleNextAlarm(appContext)) {
-                disable(appContext)
-                return
-            }
-        }
+        val repaired = if (!hasAlarmToken || remaining <= 0L) {
+            scheduleNextAlarm(appContext, remaining.takeIf { it > 0L } ?: CHECK_INTERVAL_MILLIS)
+        } else true
 
         val lastCheckAt = preferences.getLong(KEY_LAST_CHECK_AT, 0L)
-        if (lastCheckAt == 0L || now - lastCheckAt >= SUCCESS_STALE_MILLIS) {
-            enqueueCheck(appContext)
+        return try {
+            if (remaining <= 0L || lastCheckAt == 0L || now - lastCheckAt >= SUCCESS_STALE_MILLIS) {
+                enqueueCheck(appContext, "watchdog").get(8, TimeUnit.SECONDS)
+            } else {
+                enqueueCheck(appContext, "migration", onlyExisting = true).get(8, TimeUnit.SECONDS)
+            }
+            repaired
+        } catch (error: Exception) {
+            ScoreUpdateDiagnostics.record(appContext, "repair_failed", error.javaClass.simpleName)
+            false
         }
     }
 
-    private fun enqueueCheck(context: Context, expedited: Boolean = false): Operation {
-        val requestBuilder = OneTimeWorkRequestBuilder<ScoreUpdateWorker>()
-            .setConstraints(connectedConstraints)
-            .setBackoffCriteria(BackoffPolicy.EXPONENTIAL, 5, TimeUnit.MINUTES)
-        if (expedited) {
-            requestBuilder.setExpedited(
-                OutOfQuotaPolicy.RUN_AS_NON_EXPEDITED_WORK_REQUEST
-            )
+    private fun enqueueCheck(context: Context, source: String, onlyExisting: Boolean = false): CompletableFuture<Unit> {
+        val appContext = context.applicationContext
+        val expectedSession = session(appContext)
+        val completion = CompletableFuture<Unit>()
+        enqueueExecutor.execute {
+            try {
+                val manager = WorkManager.getInstance(appContext)
+                val existing = manager.getWorkInfosForUniqueWork(CHECK_WORK).get(8, TimeUnit.SECONDS)
+                    .firstOrNull { !it.state.isFinished }
+                val operation = synchronized(this) {
+                    if (!isEnabled(appContext) || session(appContext) != expectedSession) null
+                    else if (existing == null && onlyExisting) null
+                    else {
+                        val builder = OneTimeWorkRequestBuilder<ScoreUpdateWorker>()
+                            .setConstraints(connectedConstraints)
+                            .setBackoffCriteria(BackoffPolicy.EXPONENTIAL, 5, TimeUnit.MINUTES)
+                            .setExpedited(OutOfQuotaPolicy.RUN_AS_NON_EXPEDITED_WORK_REQUEST)
+                            .addTag(EXPEDITED_TAG)
+                        when {
+                            existing == null -> manager.enqueueUniqueWork(CHECK_WORK, ExistingWorkPolicy.KEEP, builder.build()).result
+                            existing.state != WorkInfo.State.RUNNING && EXPEDITED_TAG !in existing.tags -> {
+                                // updateWork preserves ID, enqueue time and retry attempts.
+                                // KEEP alone cannot upgrade old non-expedited work.
+                                existing.tags.forEach(builder::addTag)
+                                manager.updateWork(builder.setId(existing.id).build())
+                            }
+                            else -> null // Retain running, offline and backoff work.
+                        }
+                    }
+                }
+                operation?.get(8, TimeUnit.SECONDS)
+                ScoreUpdateDiagnostics.record(appContext, "enqueue_completed", "$source; existing=${existing?.state ?: "none"}")
+                completion.complete(Unit)
+            } catch (error: Exception) {
+                ScoreUpdateDiagnostics.record(appContext, "enqueue_failed", "$source; ${error.javaClass.simpleName}")
+                if (isEnabled(appContext)) scheduleRepair(appContext)
+                completion.completeExceptionally(error)
+            }
         }
-        val request = requestBuilder.build()
-        return WorkManager.getInstance(context).enqueueUniqueWork(
-            CHECK_WORK,
-            ExistingWorkPolicy.KEEP,
-            request
-        )
+        return completion
     }
 
     private fun scheduleWatchdog(context: Context) {
         val request = PeriodicWorkRequestBuilder<ScoreUpdateWatchdogWorker>(
             WATCHDOG_INTERVAL_HOURS,
             TimeUnit.HOURS
-        ).build()
+        ).setInitialDelay(WATCHDOG_INTERVAL_HOURS, TimeUnit.HOURS)
+            .setBackoffCriteria(BackoffPolicy.EXPONENTIAL, 5, TimeUnit.MINUTES).build()
         WorkManager.getInstance(context).enqueueUniquePeriodicWork(
             WATCHDOG_WORK,
             ExistingPeriodicWorkPolicy.KEEP,
@@ -352,10 +441,30 @@ internal object ScoreUpdateScheduler {
         )
     }
 
-    private fun scheduleNextAlarm(context: Context): Boolean {
+    private fun scheduleRepair(context: Context) {
+        WorkManager.getInstance(context).enqueueUniqueWork(REPAIR_WORK, ExistingWorkPolicy.KEEP,
+            OneTimeWorkRequestBuilder<ScoreUpdateRepairWorker>()
+                .setInitialDelay(5, TimeUnit.MINUTES)
+                .setBackoffCriteria(BackoffPolicy.EXPONENTIAL, 5, TimeUnit.MINUTES).build())
+    }
+
+    private fun alarmRemainingMillis(context: Context): Long {
+        val prefs = context.getSharedPreferences(APP_PREFS, Context.MODE_PRIVATE)
+        return ScoreUpdateSchedulePolicy.remainingMillis(
+            now = System.currentTimeMillis(), elapsed = SystemClock.elapsedRealtime(),
+            boot = Settings.Global.getInt(context.contentResolver, Settings.Global.BOOT_COUNT, -1),
+            scheduledAt = prefs.getLong(KEY_NEXT_ALARM_AT, 0L),
+            scheduledElapsed = prefs.getLong(KEY_NEXT_ALARM_ELAPSED, 0L),
+            scheduledBoot = prefs.getInt(KEY_ALARM_BOOT, -2)
+        )
+    }
+
+    @Synchronized
+    private fun scheduleNextAlarm(context: Context, delayMillis: Long = CHECK_INTERVAL_MILLIS): Boolean {
         if (!isEnabled(context) || !canScheduleExactAlarms(context)) return false
         val alarmManager = context.getSystemService(Context.ALARM_SERVICE) as AlarmManager
-        val triggerElapsed = SystemClock.elapsedRealtime() + CHECK_INTERVAL_MILLIS
+        val delay = delayMillis.coerceIn(1_000L, CHECK_INTERVAL_MILLIS)
+        val triggerElapsed = SystemClock.elapsedRealtime() + delay
         return runCatching {
             alarmManager.setExactAndAllowWhileIdle(
                 AlarmManager.ELAPSED_REALTIME_WAKEUP,
@@ -365,10 +474,16 @@ internal object ScoreUpdateScheduler {
             )
             context.getSharedPreferences(APP_PREFS, Context.MODE_PRIVATE)
                 .edit()
-                .putLong(KEY_NEXT_ALARM_AT, System.currentTimeMillis() + CHECK_INTERVAL_MILLIS)
+                .putLong(KEY_NEXT_ALARM_AT, System.currentTimeMillis() + delay)
+                .putLong(KEY_NEXT_ALARM_ELAPSED, triggerElapsed)
+                .putInt(KEY_ALARM_BOOT, Settings.Global.getInt(context.contentResolver, Settings.Global.BOOT_COUNT, -1))
                 .apply()
+            ScoreUpdateDiagnostics.record(context, "alarm_scheduled", "delay_ms=$delay")
             true
-        }.getOrDefault(false)
+        }.getOrElse { error ->
+            ScoreUpdateDiagnostics.record(context, "alarm_failed", error.javaClass.simpleName)
+            false
+        }
     }
 
     private fun cancelAlarm(context: Context) {

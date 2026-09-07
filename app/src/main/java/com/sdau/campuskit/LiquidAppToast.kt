@@ -10,12 +10,15 @@ import androidx.compose.animation.core.infiniteRepeatable
 import androidx.compose.animation.core.rememberInfiniteTransition
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.heightIn
+import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.text.BasicText
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
@@ -36,12 +39,15 @@ import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.drawscope.DrawScope
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.layout.LayoutCoordinates
 import androidx.compose.ui.layout.positionInRoot
 import androidx.compose.ui.platform.ComposeView
 import androidx.compose.ui.platform.ViewCompositionStrategy
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.unit.Density
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.IntSize
@@ -56,6 +62,7 @@ import com.kyant.backdrop.highlight.Highlight
 import com.kyant.backdrop.shadow.InnerShadow
 import com.kyant.backdrop.shadow.Shadow
 import com.kyant.shapes.RoundedRectangle
+import com.kyant.shapes.Capsule
 import kotlin.math.roundToInt
 
 internal enum class LiquidToastVisual {
@@ -67,6 +74,8 @@ internal enum class LiquidToastVisual {
     ERROR
 }
 
+internal data class LiquidToastAction(val label: String, val onClick: () -> Unit)
+
 /**
  * Non-modal application toast that samples the page underneath it. The snapshot is used
  * only as the glass source; the rest of this full-screen host remains transparent.
@@ -75,11 +84,13 @@ internal class LiquidAppToastView(
     context: Context,
     private var pageSnapshot: Bitmap?,
     initialMessage: String,
-    initialVisual: LiquidToastVisual
+    initialVisual: LiquidToastVisual,
+    initialAction: LiquidToastAction? = null
 ) : FrameLayout(context) {
     private val visibleState = mutableStateOf(false)
     private val messageState = mutableStateOf(initialMessage)
     private val visualState = mutableStateOf(initialVisual)
+    private val actionState = mutableStateOf(initialAction)
     private var transitionToken = 0
 
     init {
@@ -96,7 +107,7 @@ internal class LiquidAppToastView(
                     val themeColors = CampusComposeTheme.colors
                     val snapshotImage = remember(pageSnapshot) { pageSnapshot?.asImageBitmap() }
                     val backdrop = remember(snapshotImage, themeColors.isDark) {
-                        ToastSnapshotBackdrop(snapshotImage, themeColors.pageGradient)
+                        PageSnapshotBackdrop(snapshotImage, themeColors.pageGradient)
                     }
                     Box(Modifier.fillMaxSize()) {
                         LiquidStatusToast(
@@ -104,8 +115,18 @@ internal class LiquidAppToastView(
                             visual = visualState.value,
                             message = messageState.value,
                             backdrop = backdrop,
+                            action = actionState.value?.let { action ->
+                                LiquidToastAction(action.label) {
+                                    // Ignore rapid double taps and callbacks from an old toast.
+                                    if (visibleState.value && actionState.value === action) {
+                                        actionState.value = null
+                                        action.onClick()
+                                    }
+                                }
+                            },
                             modifier = Modifier
                                 .align(Alignment.BottomCenter)
+                                .then(if (actionState.value != null) Modifier.padding(horizontal = 20.dp) else Modifier)
                                 .padding(bottom = 104.dp)
                         )
                     }
@@ -116,10 +137,11 @@ internal class LiquidAppToastView(
         post { visibleState.value = true }
     }
 
-    fun update(message: String, visual: LiquidToastVisual) {
+    fun update(message: String, visual: LiquidToastVisual, action: LiquidToastAction? = null) {
         transitionToken += 1
         messageState.value = message
         visualState.value = visual
+        actionState.value = action
         visibleState.value = true
     }
 
@@ -143,7 +165,8 @@ internal fun LiquidStatusToast(
     visual: LiquidToastVisual,
     message: String,
     backdrop: Backdrop,
-    modifier: Modifier = Modifier
+    modifier: Modifier = Modifier,
+    action: LiquidToastAction? = null
 ) {
     var lastVisual by remember { mutableStateOf(visual) }
     var lastMessage by remember { mutableStateOf(message) }
@@ -180,7 +203,7 @@ internal fun LiquidStatusToast(
             }
             .drawBackdrop(
                 backdrop = backdrop,
-                shape = { RoundedRectangle(24.dp) },
+                shape = { Capsule() },
                 effects = {
                     if (themeColors.isDark) {
                         colorControls(brightness = 0f, saturation = 0.48f)
@@ -207,7 +230,7 @@ internal fun LiquidStatusToast(
                     )
                 }
             )
-            .padding(horizontal = 16.dp, vertical = 11.dp),
+            .padding(horizontal = 16.dp, vertical = if (action != null) 4.dp else 9.dp),
         horizontalArrangement = Arrangement.spacedBy(11.dp),
         verticalAlignment = Alignment.CenterVertically
     ) {
@@ -356,16 +379,36 @@ internal fun LiquidStatusToast(
         }
         BasicText(
             displayMessage,
+            modifier = if (action != null) Modifier.weight(1f, fill = false) else Modifier,
+            maxLines = if (action != null) 2 else Int.MAX_VALUE,
+            overflow = TextOverflow.Ellipsis,
             style = TextStyle(
                 color = themeColors.primaryText,
                 fontSize = 15.sp,
                 fontWeight = FontWeight.SemiBold
             )
         )
+        if (action != null) {
+            Box(
+                modifier = Modifier
+                    .widthIn(min = 48.dp)
+                    .heightIn(min = 40.dp)
+                    .clip(RoundedRectangle(12.dp))
+                    .clickable(enabled = visible, role = Role.Button, onClick = action.onClick)
+                    .padding(horizontal = 6.dp),
+                contentAlignment = Alignment.Center
+            ) {
+                BasicText(action.label, style = TextStyle(
+                    color = accent,
+                    fontSize = 15.sp,
+                    fontWeight = FontWeight.SemiBold
+                ))
+            }
+        }
     }
 }
 
-private class ToastSnapshotBackdrop(
+internal class PageSnapshotBackdrop(
     private val snapshot: ImageBitmap?,
     private val fallbackGradient: List<Color>
 ) : Backdrop {

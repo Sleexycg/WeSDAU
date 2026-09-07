@@ -21,8 +21,8 @@ android {
         applicationId = "com.sdau.campuskit"
         minSdk = 26
         targetSdk = 34
-        versionCode = 15
-        versionName = "0.4.0"
+        versionCode = 16
+        versionName = "0.4.1"
         androidResources.localeFilters += arrayOf("zh", "en")
     }
 
@@ -50,6 +50,15 @@ android {
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro"
             )
+        }
+        // Explicit opt-in device diagnostics, signed like release for data-preserving installs.
+        // Its adb-only receiver is NOT included in debug or release APKs.
+        create("scoreDiagnostics") {
+            initWith(getByName("release"))
+            isDebuggable = true
+            isMinifyEnabled = false
+            isShrinkResources = false
+            matchingFallbacks += "release"
         }
     }
 

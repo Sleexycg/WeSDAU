@@ -217,7 +217,7 @@ private fun LiquidAppearanceDialog(
                     verticalArrangement = Arrangement.spacedBy(4.dp)
                 ) {
                     BasicText(
-                        "外观（Beta功能）",
+                        "外观",
                         style = TextStyle(themeColors.primaryText, 22.sp, FontWeight.SemiBold)
                     )
                     BasicText(
