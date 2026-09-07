@@ -1,6 +1,7 @@
 package com.sdau.campuskit
 
 import java.util.Calendar
+import java.time.LocalDate
 
 internal object AcademicTermCalendar {
     const val OFFICIAL_TERM = "2026-2027-1"
@@ -35,6 +36,23 @@ internal object AcademicTermCalendar {
             }
         }
         set(Calendar.MILLISECOND, 0)
+    }
+
+    // Compare calendar dates, not elapsed milliseconds: midnight milliseconds and
+    // daylight-saving changes must not move the start of a teaching week.
+    fun weekForDate(term: String, now: Calendar = Calendar.getInstance()): Int {
+        val days = daysFromStart(term, now)
+        return if (days < 0) 0 else (days / 7 + 1).coerceIn(1, 20).toInt()
+    }
+
+    fun daysUntilStart(term: String, now: Calendar = Calendar.getInstance()): Int =
+        (-daysFromStart(term, now)).coerceAtLeast(0).toInt()
+
+    private fun daysFromStart(term: String, now: Calendar): Long {
+        fun Calendar.epochDay(): Long = LocalDate.of(
+            get(Calendar.YEAR), get(Calendar.MONTH) + 1, get(Calendar.DAY_OF_MONTH)
+        ).toEpochDay()
+        return now.epochDay() - startDate(term).epochDay()
     }
 
     fun currentTerm(now: Calendar = Calendar.getInstance()): String {

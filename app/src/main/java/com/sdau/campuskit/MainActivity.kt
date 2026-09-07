@@ -350,6 +350,13 @@ class MainActivity : ComponentActivity() {
     private var pushEnabled = false
     private var scheduleMode = ScheduleTimePolicy.currentMode()
     private var currentWeek = 1
+    private var scheduleCalendarKey: String? = null
+    private var scheduleDateReceiverRegistered = false
+    private val scheduleDateReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context, intent: Intent) {
+            refreshScheduleCalendar()
+        }
+    }
     private var pendingApkUrl = APK_URL
     private val networkExecutor = Executors.newSingleThreadExecutor()
     private val publicSyncExecutor = Executors.newSingleThreadExecutor()
@@ -961,13 +968,23 @@ class MainActivity : ComponentActivity() {
 
     private fun termStartDate(term: String): Calendar = AcademicTermCalendar.startDate(term)
 
-    private fun weekForTerm(term: String): Int {
-        val start = termStartDate(term)
-        val today = Calendar.getInstance()
-        start.set(Calendar.HOUR_OF_DAY, 0); start.set(Calendar.MINUTE, 0); start.set(Calendar.SECOND, 0)
-        today.set(Calendar.HOUR_OF_DAY, 0); today.set(Calendar.MINUTE, 0); today.set(Calendar.SECOND, 0)
-        val days = ((today.timeInMillis - start.timeInMillis) / 86_400_000L).toInt()
-        return if (days < 0) 0 else (days / 7 + 1).coerceIn(1, 20)
+    private fun weekForTerm(term: String): Int = AcademicTermCalendar.weekForDate(term)
+
+    private fun minimumScheduleWeek(): Int =
+        if (isHistoricalPersonalTerm()) 0 else weekForTerm(activeScheduleTerm()).coerceAtMost(1)
+
+    private fun refreshScheduleCalendar() {
+        if (onLoginPage) return
+        val grid = scheduleGrid ?: return
+        val key = "${todayLabel()}|${activeScheduleTerm()}|$viewingPublicSchedule|${Calendar.getInstance().timeZone.id}"
+        if (key == scheduleCalendarKey) return
+        scheduleCalendarKey = key
+        // Leave deliberately selected weeks and historical overviews alone;
+        // only retire the pre-term page once this term has actually started.
+        currentWeek = currentWeek.coerceIn(minimumScheduleWeek(), 20)
+        grid.setWeekIndex(currentWeek)
+        scheduleHeader?.updateWeek(formatWeekLabel(currentWeek))
+        scheduleHeader?.updateDate(scheduleHeaderDateLabel())
     }
 
     private fun initialPersonalWeek(term: String): Int {
@@ -1353,8 +1370,12 @@ class MainActivity : ComponentActivity() {
                         !onLoginPage ||
                         loginMode != LoginMode.PERSONAL
                     ) return@runOnUiThread
-                    if (error is CourseScheduleNotPublishedException && hasCourseCache(id, selectedSemester)) {
-                        activateCourseCache(id, selectedSemester)
+                    if (error is CourseScheduleNotPublishedException) {
+                        // queryCourses authenticates before reporting publication status.
+                        // Resolve the old cache before switching account/term, otherwise
+                        // the previous account's legacy cache could be claimed as this one.
+                        val restoredCourseCache = activateCourseCache(id, selectedSemester)
+                        if (!restoredCourseCache) activateCustomCourseCache(id, selectedSemester)
                         val preferences = getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
                         val studentName = cachedStudentName(id)
                         preferences.edit()
@@ -1363,12 +1384,26 @@ class MainActivity : ComponentActivity() {
                             .putString(KEY_TERM, selectedSemester)
                             .putString(KEY_SCORE_TERM, selectedSemester)
                             .putString(KEY_STUDENT_NAME, studentName)
+                            .remove(KEY_SCORES)
+                            .remove(KEY_EXAMS)
                             .apply()
                         savePasswordCache(id, pwd)
-                        notifyCourseDataChanged()
+                        saveStudentNameCache(id, studentName)
+                        if (restoredCourseCache) {
+                            notifyCourseDataChanged()
+                        } else {
+                            // Persist an empty cache only for a genuinely uncached term.
+                            // This also lets the authenticated session reopen offline.
+                            saveCourseCache(emptyList(), id, selectedSemester)
+                        }
                         loginButton?.setButtonEnabled(true)
                         loginButton?.text = "进入课程表"
                         showSchedulePage()
+                        showLiquidToast(
+                            message = "当前学期课表未公布",
+                            visual = LiquidToastVisual.ERROR,
+                            durationMillis = 2_800L
+                        )
                         return@runOnUiThread
                     }
                     showLoginError(error)
@@ -6458,15 +6493,7 @@ class MainActivity : ComponentActivity() {
 
     private fun todayLabel(): String = SimpleDateFormat("yyyy/M/d", Locale.CHINA).format(Calendar.getInstance().time)
 
-    private fun daysUntilTermStart(): Int {
-        val start = termStartDate(selectedTerm()).apply {
-            set(Calendar.HOUR_OF_DAY, 0); set(Calendar.MINUTE, 0); set(Calendar.SECOND, 0)
-        }
-        val today = Calendar.getInstance().apply {
-            set(Calendar.HOUR_OF_DAY, 0); set(Calendar.MINUTE, 0); set(Calendar.SECOND, 0)
-        }
-        return ((start.timeInMillis - today.timeInMillis) / 86_400_000L).toInt().coerceAtLeast(0)
-    }
+    private fun daysUntilTermStart(): Int = AcademicTermCalendar.daysUntilStart(activeScheduleTerm())
 
     private fun formatWeekLabel(week: Int): String {
         if (isHistoricalOverview(week)) {
@@ -8206,6 +8233,7 @@ class MainActivity : ComponentActivity() {
         private val paint = Paint(Paint.ANTI_ALIAS_FLAG)
         private val rect = RectF()
         private var weekIndex = 1
+        private var minimumWeekIndex = minimumScheduleWeek()
         private var scheduleMode = ScheduleMode.SPRING
         private var timeColumnWidth = 0
         private var dayColumnWidth = 0
@@ -8290,7 +8318,7 @@ class MainActivity : ComponentActivity() {
                         parent?.requestDisallowInterceptTouchEvent(false)
                     } else if (gestureAxis == 1) {
                         parent?.requestDisallowInterceptTouchEvent(true)
-                        val canMove = (dx < 0f && weekIndex < 20) || (dx > 0f && weekIndex > 0)
+                        val canMove = (dx < 0f && weekIndex < 20) || (dx > 0f && weekIndex > minimumWeekIndex)
                         if (canMove) prepareSwipeBitmaps(if (dx < 0f) weekIndex + 1 else weekIndex - 1)
                         dragOffset = if (canMove) {
                             dx.coerceIn(-desiredWidth.toFloat(), desiredWidth.toFloat())
@@ -8314,13 +8342,13 @@ class MainActivity : ComponentActivity() {
                         val delta = if (fastFling) {
                             when {
                                 velocityX < 0f && weekIndex < 20 -> 1
-                                velocityX > 0f && weekIndex > 0 -> -1
+                                velocityX > 0f && weekIndex > minimumWeekIndex -> -1
                                 else -> 0
                             }
                         } else {
                             when {
                                 projectedOffset <= -threshold && weekIndex < 20 -> 1
-                                projectedOffset >= threshold && weekIndex > 0 -> -1
+                                projectedOffset >= threshold && weekIndex > minimumWeekIndex -> -1
                                 else -> 0
                             }
                         }
@@ -8349,9 +8377,14 @@ class MainActivity : ComponentActivity() {
         }
 
         fun setWeekIndex(index: Int) {
+            pageAnimator?.removeAllListeners()
+            pageAnimator?.cancel()
+            pageAnimator = null
+            dragOffset = 0f
             clearAddCourseSelection(invalidateView = false)
             clearSwipeBitmaps()
-            weekIndex = index
+            minimumWeekIndex = minimumScheduleWeek()
+            weekIndex = index.coerceIn(minimumWeekIndex, 20)
             invalidate()
         }
         fun setScheduleMode(mode: ScheduleMode) { clearSwipeBitmaps(); scheduleMode = mode; invalidate() }
@@ -8572,7 +8605,7 @@ class MainActivity : ComponentActivity() {
             drawWeekPage(canvas, weekIndex, dragOffset)
             if (dragOffset < 0f && weekIndex < 20) {
                 drawWeekPage(canvas, weekIndex + 1, desiredWidth + dragOffset)
-            } else if (dragOffset > 0f && weekIndex > 0) {
+            } else if (dragOffset > 0f && weekIndex > minimumWeekIndex) {
                 drawWeekPage(canvas, weekIndex - 1, -desiredWidth + dragOffset)
             }
         }
@@ -8932,7 +8965,7 @@ class MainActivity : ComponentActivity() {
                     override fun onAnimationEnd(animation: android.animation.Animator) {
                         if (delta != 0) {
                             clearAddCourseSelection(invalidateView = false)
-                            weekIndex = (weekIndex + delta).coerceIn(0, 20)
+                            weekIndex = (weekIndex + delta).coerceIn(minimumWeekIndex, 20)
                             currentWeek = weekIndex
                             scheduleHeader?.updateWeek(formatWeekLabel(currentWeek))
                             scheduleHeader?.updateDate(scheduleHeaderDateLabel())
@@ -9688,8 +9721,34 @@ class MainActivity : ComponentActivity() {
         window.setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE)
     }
 
+    override fun onStart() {
+        super.onStart()
+        if (!scheduleDateReceiverRegistered) {
+            ContextCompat.registerReceiver(
+                this,
+                scheduleDateReceiver,
+                IntentFilter().apply {
+                    addAction(Intent.ACTION_DATE_CHANGED)
+                    addAction(Intent.ACTION_TIME_CHANGED)
+                    addAction(Intent.ACTION_TIMEZONE_CHANGED)
+                },
+                ContextCompat.RECEIVER_NOT_EXPORTED
+            )
+            scheduleDateReceiverRegistered = true
+        }
+    }
+
+    override fun onStop() {
+        if (scheduleDateReceiverRegistered) {
+            unregisterReceiver(scheduleDateReceiver)
+            scheduleDateReceiverRegistered = false
+        }
+        super.onStop()
+    }
+
     override fun onResume() {
         super.onResume()
+        refreshScheduleCalendar()
         hideSystemNavigationBar()
         if (dormElectricityOverlay != null) {
             scheduleDormRechargeVerification(delayMillis = 350L, attemptsRemaining = 60)
