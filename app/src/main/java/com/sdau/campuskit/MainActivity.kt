@@ -8246,6 +8246,10 @@ class MainActivity : ComponentActivity() {
         private var dragOffset = 0f
         private var gestureAxis = 0 // 0 未确定，1 横向翻页，2 纵向手势
         private var pageAnimator: ValueAnimator? = null
+        private var courseRemovalAnimator: ValueAnimator? = null
+        private var removingCourse: Course? = null
+        private var courseRemovalProgress = 0f
+        private var coursesAfterRemoval: List<Course>? = null
         private var pageVelocityTracker: VelocityTracker? = null
         private var cachedCurrentPage: Bitmap? = null
         private var cachedAdjacentPage: Bitmap? = null
@@ -8296,6 +8300,7 @@ class MainActivity : ComponentActivity() {
         }
 
         override fun onTouchEvent(event: MotionEvent): Boolean {
+            if (courseRemovalAnimator != null) return true
             when (event.actionMasked) {
                 MotionEvent.ACTION_DOWN -> {
                     if (pageAnimator != null) return false
@@ -8377,6 +8382,7 @@ class MainActivity : ComponentActivity() {
         }
 
         fun setWeekIndex(index: Int) {
+            finishCourseRemoval()
             pageAnimator?.removeAllListeners()
             pageAnimator?.cancel()
             pageAnimator = null
@@ -8389,10 +8395,55 @@ class MainActivity : ComponentActivity() {
         }
         fun setScheduleMode(mode: ScheduleMode) { clearSwipeBitmaps(); scheduleMode = mode; invalidate() }
         fun setCourses(updated: List<Course>) {
+            finishCourseRemoval()
             clearAddCourseSelection(invalidateView = false)
             clearSwipeBitmaps()
             courses = updated
             invalidate()
+        }
+
+        fun animateCourseRemoval(course: Course, updated: List<Course>) {
+            // The cache is already saved. Animation only delays the visible update,
+            // so leaving the page cannot cancel the user's deletion.
+            finishCourseRemoval()
+            if (!isAttachedToWindow || !courseVisibleOnDisplayedSchedule(course, weekIndex) ||
+                courses.none { sameCourseRecord(it, course) }
+            ) {
+                setCourses(updated)
+                return
+            }
+            clearAddCourseSelection(invalidateView = false)
+            clearSwipeBitmaps()
+            removingCourse = course
+            coursesAfterRemoval = updated
+            courseRemovalProgress = 0f
+            val animator = ValueAnimator.ofFloat(0f, 1f).apply {
+                duration = 220L
+                interpolator = PathInterpolator(.2f, 0f, .2f, 1f)
+                addUpdateListener {
+                    courseRemovalProgress = it.animatedValue as Float
+                    postInvalidateOnAnimation()
+                }
+                addListener(object : android.animation.AnimatorListenerAdapter() {
+                    override fun onAnimationEnd(animation: android.animation.Animator) {
+                        finishCourseRemoval()
+                        invalidate()
+                    }
+                })
+            }
+            courseRemovalAnimator = animator
+            animator.start()
+        }
+
+        private fun finishCourseRemoval() {
+            courseRemovalAnimator?.removeAllUpdateListeners()
+            courseRemovalAnimator?.removeAllListeners()
+            courseRemovalAnimator?.cancel()
+            courseRemovalAnimator = null
+            coursesAfterRemoval?.let { courses = it }
+            coursesAfterRemoval = null
+            removingCourse = null
+            courseRemovalProgress = 0f
         }
         fun refreshTextPalette() { clearSwipeBitmaps(); invalidate() }
 
@@ -8563,6 +8614,7 @@ class MainActivity : ComponentActivity() {
         }
 
         fun releaseTransientCaches() {
+            finishCourseRemoval()
             clearAddCourseSelection(invalidateView = false)
             pageAnimator?.removeAllUpdateListeners()
             pageAnimator?.removeAllListeners()
@@ -8572,6 +8624,7 @@ class MainActivity : ComponentActivity() {
             pageVelocityTracker = null
             dragOffset = 0f
             clearSwipeBitmaps()
+            invalidate()
         }
 
         override fun onDraw(canvas: Canvas) {
@@ -9192,6 +9245,21 @@ class MainActivity : ComponentActivity() {
             val right = left + courseWidth
             val bottom = headerHeight + (course.startSlot + course.slotCount) * slotHeight - dp(2f)
             rect.set(left.toFloat(), top.toFloat(), right.toFloat(), bottom.toFloat())
+            val removalProgress = if (removingCourse?.let { sameCourseRecord(it, course) } == true) {
+                courseRemovalProgress.coerceIn(0f, 1f)
+            } else 0f
+            if (removalProgress >= 1f) return
+            val removalLayer = if (removalProgress > 0f) {
+                // Fade the fill, outline and text together within this card's bounds.
+                val inset = dp(3f).toFloat()
+                canvas.saveLayerAlpha(
+                    rect.left - inset, rect.top - inset, rect.right + inset, rect.bottom + inset,
+                    ((1f - removalProgress) * 255f).roundToInt()
+                ).also {
+                    val scale = 1f - .08f * removalProgress
+                    canvas.scale(scale, scale, rect.centerX(), rect.centerY())
+                }
+            } else null
             paint.style = Paint.Style.FILL
             paint.color = displayedCourseColor(course.background)
             val corner = minOf(dp(9f).toFloat(), dayColumnWidth * .12f); canvas.drawRoundRect(rect, corner, corner, paint)
@@ -9234,6 +9302,7 @@ class MainActivity : ComponentActivity() {
                     baseline += lineHeight
                 }
             }
+            removalLayer?.let(canvas::restoreToCount)
         }
 
         private fun findCourseAt(x: Float, y: Float): Course? {
@@ -9503,6 +9572,7 @@ class MainActivity : ComponentActivity() {
                 pageSnapshot?.takeUnless(Bitmap::isRecycled)?.recycle()
                 return@captureUpdateBackdrop
             }
+            var deletionRequested = false
             val dialog = LiquidCourseDialogView(
                 context = this,
                 pageSnapshot = pageSnapshot,
@@ -9520,10 +9590,13 @@ class MainActivity : ComponentActivity() {
                     updateCourseCache(course, name, room, teacher, weeks, slotCount)
                     hideCourseDetails()
                 },
-                onDelete = if (!viewingPublicSchedule && course.isCustom) {
+                onDelete = if (!viewingPublicSchedule) {
                     {
-                        deleteCourseFromCache(course)
-                        hideCourseDetails()
+                        if (!deletionRequested) {
+                            deletionRequested = true
+                            deleteCourseFromCache(course)
+                            hideCourseDetails()
+                        }
                     }
                 } else null,
                 onDismiss = ::hideCourseDetails
@@ -9669,11 +9742,12 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun deleteCourseFromCache(course: Course) {
-        if (!course.isCustom) return
-        val updated = loadCustomCourseCache().filterNot { current -> sameCourseRecord(current, course) }
+        if (viewingPublicSchedule) return
+        val source = if (course.isCustom) loadCustomCourseCache() else loadImportedCourseCache()
+        val updated = source.filterNot { current -> sameCourseRecord(current, course) }
         val recolored = recolorCourses(updated)
-        saveCustomCourseCache(recolored)
-        scheduleGrid?.setCourses(loadCourseCache())
+        if (course.isCustom) saveCustomCourseCache(recolored) else saveCourseCache(recolored)
+        scheduleGrid?.animateCourseRemoval(course, loadCourseCache())
     }
 
     private fun sameCourseRecord(first: Course, second: Course): Boolean =
