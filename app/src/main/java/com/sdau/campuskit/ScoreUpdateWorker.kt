@@ -265,6 +265,8 @@ internal object ScoreUpdateScheduler {
     @Synchronized
     fun enable(context: Context): Boolean {
         val appContext = context.applicationContext
+        // Explicit enabling only: leave recovery/retry and any existing reminder untouched.
+        if (ReminderBackgroundSettings.batteryAccess(appContext) != ReminderBatteryAccess.ALLOWED) return false
         if (!canScheduleExactAlarms(appContext)) {
             disable(appContext)
             return false

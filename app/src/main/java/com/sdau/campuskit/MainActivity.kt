@@ -74,6 +74,7 @@ import androidx.core.view.ViewCompat
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
+import androidx.core.view.doOnDetach
 import com.google.android.material.card.MaterialCardView
 import com.google.android.material.textfield.TextInputEditText
 import com.google.android.material.textfield.TextInputLayout
@@ -369,6 +370,23 @@ class MainActivity : ComponentActivity() {
     private val backgroundPicker = registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
         uri?.let(::prepareCustomBackground)
     }
+    private val reminderBackgroundGuide = ReminderBackgroundAccessGuide(
+        activity = this,
+        host = { pageHost },
+        capture = ::captureUpdateBackdrop,
+        preparePrompt = ::prepareReminderBackgroundPrompt,
+        clearToast = ::clearLiquidToastImmediately,
+        notify = { message ->
+            showLiquidToast(message = message, visual = LiquidToastVisual.BELL_OFF, durationMillis = 2_800L)
+        },
+        onReady = { feature ->
+            // Recheck notification/alarm permissions and credentials after returning from Settings.
+            when (feature) {
+                ReminderFeature.COURSE -> requestCourseReminderEnable()
+                ReminderFeature.SCORE -> requestScoreUpdateMonitoringEnable()
+            }
+        }
+    )
     @Suppress("DEPRECATION")
     private val currentVersionCode: Int by lazy {
         packageManager.getPackageInfo(packageName, 0).let { info ->
@@ -429,6 +447,7 @@ class MainActivity : ComponentActivity() {
         CourseWidgetProvider.cancelLegacyNetworkRefresh(this)
         startPublicScheduleSyncIfNeeded(inferredCurrentTerm())
         if (hasLocalCourseCache()) showSchedulePage() else showLoginPage(false)
+        reminderBackgroundGuide.restoreState(state?.getBundle("reminder_background_guide"))
         checkForOnlineUpdate()
         window.decorView.post(::hideSystemNavigationBar)
     }
@@ -4423,6 +4442,19 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    private fun prepareReminderBackgroundPrompt(onPrepared: () -> Unit) {
+        val menu = actionMenuOverlay
+        if (menu == null) {
+            onPrepared()
+            return
+        }
+        // Observe actual removal: collapse() ignores another request if already collapsing.
+        // The guide waits for a fresh page frame after this callback, so the menu and its
+        // scrim cannot be captured into the permission dialog's retained backdrop.
+        menu.doOnDetach { onPrepared() }
+        hideActionMenu()
+    }
+
     private fun hideActionMenu(afterDismiss: (() -> Unit)? = null) {
         val overlay = actionMenuOverlay
         if (overlay == null) {
@@ -6276,6 +6308,9 @@ class MainActivity : ComponentActivity() {
     private fun togglePushNotifications() {
         pushEnabled = CourseReminderScheduler.isEnabled(this)
         if (pushEnabled) {
+            reminderBackgroundGuide.cancel(ReminderFeature.COURSE)
+            pendingPushEnable = false
+            pendingExactAlarmEnable = false
             pushEnabled = false
             CourseReminderScheduler.disable(this)
             showLiquidToast(
@@ -6283,8 +6318,14 @@ class MainActivity : ComponentActivity() {
                 visual = LiquidToastVisual.BELL_OFF,
                 durationMillis = 1_800L
             )
+            reminderBackgroundGuide.begin(ReminderFeature.COURSE, ReminderAccessAction.DISABLE)
             return
         }
+        reminderBackgroundGuide.begin(ReminderFeature.COURSE)
+    }
+
+    private fun requestCourseReminderEnable() {
+        if (!checkReminderBatteryBeforeEnable(ReminderFeature.COURSE)) return
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
             checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
             pendingPushEnable = true
@@ -6295,6 +6336,7 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun continueEnablingPushNotifications() {
+        if (!checkReminderBatteryBeforeEnable(ReminderFeature.COURSE)) return
         CourseNotification.blockedReason(this)?.let { reason ->
             showLiquidToast(message = reason, visual = LiquidToastVisual.BELL_OFF, durationMillis = 2_800L)
             runCatching {
@@ -6321,6 +6363,7 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun enablePushNotifications() {
+        if (!checkReminderBatteryBeforeEnable(ReminderFeature.COURSE)) return
         val result = CourseReminderScheduler.enable(this)
         if (result.scheduled) CourseReminderScheduler.showPreview(this)
         pushEnabled = CourseReminderScheduler.isEnabled(this)
@@ -6331,6 +6374,27 @@ class MainActivity : ComponentActivity() {
             visual = if (error != null) LiquidToastVisual.ERROR else if (pushEnabled) LiquidToastVisual.BELL_ON else LiquidToastVisual.BELL_OFF,
             durationMillis = 2_800L
         )
+    }
+
+    /** Recheck after external permission pages as well as immediately before creating any work. */
+    private fun checkReminderBatteryBeforeEnable(feature: ReminderFeature): Boolean {
+        val message = ReminderBackgroundSettings.blockedMessage(ReminderBackgroundSettings.batteryAccess(this))
+            ?: return true
+        when (feature) {
+            ReminderFeature.COURSE -> {
+                pendingPushEnable = false
+                pendingExactAlarmEnable = false
+                pushEnabled = CourseReminderScheduler.isEnabled(this)
+                actionMenuOverlay?.setPushState(pushEnabled)
+            }
+            ReminderFeature.SCORE -> {
+                pendingScoreUpdateEnable = false
+                pendingScoreExactAlarmEnable = false
+                scoreUpdatesEnabled.value = ScoreUpdateScheduler.isEnabled(this)
+            }
+        }
+        showLiquidToast(message = message, visual = LiquidToastVisual.BELL_OFF, durationMillis = 2_800L)
+        return false
     }
 
     private fun canScheduleExactCourseReminders(): Boolean {
@@ -6378,13 +6442,19 @@ class MainActivity : ComponentActivity() {
 
     private fun setScoreUpdateMonitoringEnabled(enabled: Boolean) {
         if (!enabled) {
+            reminderBackgroundGuide.cancel(ReminderFeature.SCORE)
             pendingScoreUpdateEnable = false
             pendingScoreExactAlarmEnable = false
             ScoreUpdateScheduler.disable(this)
             scoreUpdatesEnabled.value = false
+            reminderBackgroundGuide.begin(ReminderFeature.SCORE, ReminderAccessAction.DISABLE)
             return
         }
+        requestScoreUpdateMonitoringEnable(checkBackground = true)
+    }
 
+    private fun requestScoreUpdateMonitoringEnable(checkBackground: Boolean = false) {
+        if (reuseEnabledScoreUpdateMonitoring()) return
         val preferences = getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
         val account = preferences.getString(KEY_ACCOUNT, "").orEmpty().trim()
         val password = preferences.getString(KEY_PASSWORD, "").orEmpty()
@@ -6397,6 +6467,11 @@ class MainActivity : ComponentActivity() {
             )
             return
         }
+        if (checkBackground) {
+            reminderBackgroundGuide.begin(ReminderFeature.SCORE)
+            return
+        }
+        if (!checkReminderBatteryBeforeEnable(ReminderFeature.SCORE)) return
 
         if (
             Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
@@ -6415,6 +6490,8 @@ class MainActivity : ComponentActivity() {
 
     private fun completeScoreUpdateMonitoringEnable() {
         pendingScoreUpdateEnable = false
+        if (reuseEnabledScoreUpdateMonitoring()) return
+        if (!checkReminderBatteryBeforeEnable(ReminderFeature.SCORE)) return
         if (!canScheduleExactCourseReminders()) {
             pendingScoreExactAlarmEnable = true
             ScoreUpdateScheduler.disable(this)
@@ -6432,17 +6509,33 @@ class MainActivity : ComponentActivity() {
 
     private fun activateScoreUpdateMonitoring() {
         pendingScoreExactAlarmEnable = false
+        if (reuseEnabledScoreUpdateMonitoring()) return
+        if (!checkReminderBatteryBeforeEnable(ReminderFeature.SCORE)) return
         val enabled = ScoreUpdateScheduler.enable(this)
         scoreUpdatesEnabled.value = enabled
         if (enabled) {
+            // Successful activation is toast-free; this is the requested system test notification.
+            clearLiquidToastImmediately()
             ScoreUpdateNotification.showTest(this)
         } else {
             showLiquidToast(
-                message = "未获得闹钟权限，成绩提醒无法开启",
+                message = ReminderBackgroundSettings.blockedMessage(ReminderBackgroundSettings.batteryAccess(this))
+                    ?: "未获得闹钟权限，成绩提醒无法开启",
                 visual = LiquidToastVisual.BELL_OFF,
                 durationMillis = 2_800L
             )
         }
+    }
+
+    /** A toggle drag or duplicate permission callback can submit true even when already on. */
+    private fun reuseEnabledScoreUpdateMonitoring(): Boolean {
+        if (!ScoreUpdateScheduler.isEnabled(this)) return false
+        pendingScoreUpdateEnable = false
+        pendingScoreExactAlarmEnable = false
+        scoreUpdatesEnabled.value = true
+        clearLiquidToastImmediately()
+        // Keep the existing session, retry chain and deadline. No toast or repeat test notification.
+        return true
     }
 
     override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<String>, grantResults: IntArray) {
@@ -7518,6 +7611,7 @@ class MainActivity : ComponentActivity() {
 
     @Deprecated("Use OnBackInvokedDispatcher on newer Android versions")
     override fun onBackPressed() {
+        if (reminderBackgroundGuide.cancel()) return
         if (courseDragSource != null) {
             cancelCourseDragDeletion()
             return
@@ -10111,6 +10205,11 @@ class MainActivity : ComponentActivity() {
     override fun onWindowFocusChanged(hasFocus: Boolean) {
         super.onWindowFocusChanged(hasFocus)
         if (hasFocus) hideSystemNavigationBar()
+    }
+
+    override fun onSaveInstanceState(outState: Bundle) {
+        outState.putBundle("reminder_background_guide", reminderBackgroundGuide.saveState())
+        super.onSaveInstanceState(outState)
     }
 
     override fun onDestroy() {

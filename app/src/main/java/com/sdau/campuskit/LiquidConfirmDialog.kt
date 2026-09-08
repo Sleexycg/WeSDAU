@@ -46,7 +46,8 @@ internal class LiquidConfirmDialogView(
     confirmLabel: String,
     showCancel: Boolean = true,
     onDismiss: () -> Unit,
-    onConfirm: () -> Unit
+    onConfirm: () -> Unit,
+    showFallbackBackground: Boolean = true
 ) : FrameLayout(context) {
     init {
         setBackgroundColor(android.graphics.Color.TRANSPARENT)
@@ -61,7 +62,8 @@ internal class LiquidConfirmDialogView(
                     confirmLabel = confirmLabel,
                     showCancel = showCancel,
                     onDismiss = onDismiss,
-                    onConfirm = onConfirm
+                    onConfirm = onConfirm,
+                    showFallbackBackground = showFallbackBackground
                 )
             },
             LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.MATCH_PARENT)
@@ -82,7 +84,8 @@ private fun LiquidConfirmDialog(
     confirmLabel: String,
     showCancel: Boolean,
     onDismiss: () -> Unit,
-    onConfirm: () -> Unit
+    onConfirm: () -> Unit,
+    showFallbackBackground: Boolean
 ) {
     val themeColors = CampusComposeTheme.colors
     val contentColor = themeColors.primaryText
@@ -99,7 +102,7 @@ private fun LiquidConfirmDialog(
                     modifier = Modifier.fillMaxSize(),
                     contentScale = ContentScale.FillBounds
                 )
-            } else {
+            } else if (showFallbackBackground) {
                 Box(Modifier.fillMaxSize().background(themeColors.pageBackground))
             }
             Box(Modifier.fillMaxSize().background(themeColors.dialogScrim))

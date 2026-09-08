@@ -153,6 +153,9 @@ object CourseReminderScheduler {
     /** The explicit enable action is the only place where the reminder account changes. */
     @Synchronized
     fun enable(context: Context): ScheduleResult {
+        ReminderBackgroundSettings.blockedMessage(ReminderBackgroundSettings.batteryAccess(context))?.let {
+            return ScheduleResult(false, it)
+        }
         val prefs = preferences(context)
         val account = prefs.getString(KEY_ACCOUNT, "").orEmpty()
         if (account.isBlank()) return ScheduleResult(false, "请先登录个人账号后开启课程提醒")
