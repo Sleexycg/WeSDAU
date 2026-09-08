@@ -6,6 +6,7 @@ import android.graphics.BitmapFactory
 import android.widget.FrameLayout
 import androidx.activity.compose.BackHandler
 import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.ExitTransition
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.animation.scaleIn
@@ -17,8 +18,12 @@ import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.foundation.text.TextAutoSize
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxWithConstraints
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
@@ -37,6 +42,8 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -53,6 +60,9 @@ import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.res.painterResource
+import androidx.compose.ui.layout.boundsInRoot
+import androidx.compose.ui.layout.onGloballyPositioned
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextDecoration
@@ -72,8 +82,6 @@ import com.kyant.backdrop.effects.vibrancy
 import com.kyant.backdrop.highlight.Highlight
 import com.kyant.shapes.RoundedRectangle
 import java.util.Locale
-import java.text.SimpleDateFormat
-import java.util.Date
 
 private fun dormOutlineColor(isDark: Boolean): Color =
     if (isDark) Color.White.copy(alpha = 0.18f)
@@ -82,6 +90,8 @@ private fun dormOutlineColor(isDark: Boolean): Color =
 private val DormRechargeDialogCardHeight = 420.dp
 private val DormRechargeDialogHorizontalPadding = 16.dp
 private val DormRechargeDialogVerticalOffset = 48.dp
+private val DormRechargeDialogContentPadding = 20.dp
+private val DormRechargeDialogTitleTopPadding = 22.dp
 
 internal enum class DormElectricityLoading {
     CAMPUSES,
@@ -95,15 +105,19 @@ internal data class DormElectricityUiState(
     val campuses: List<DormElectricityOption> = emptyList(),
     val buildings: List<DormElectricityOption> = emptyList(),
     val rooms: List<DormElectricityOption> = emptyList(),
-    val equipmentTypes: List<DormElectricityOption> = DormElectricityPolicy.defaultTypes,
+    val equipmentTypes: List<DormElectricityOption> = emptyList(),
     val campus: DormElectricityOption? = null,
     val building: DormElectricityOption? = null,
     val room: DormElectricityOption? = null,
-    val equipment: DormElectricityOption? = DormElectricityPolicy.defaultTypes.firstOrNull(),
+    val equipment: DormElectricityOption? = null,
     val reading: DormElectricityReading? = null,
+    val lastQuery: DormQuerySnapshot? = null,
     val rechargeQr: DormRechargeQr? = null,
     val rechargeError: String? = null,
     val rechargeHistory: List<DormRechargeHistoryEntry> = emptyList(),
+    val historyLoading: Boolean = false,
+    val historyError: String? = null,
+    val historyHasMore: Boolean = false,
     val loading: DormElectricityLoading? = null,
     val error: String? = null
 )
@@ -122,11 +136,17 @@ internal class LiquidDormElectricityPageView(
     onQuery: () -> Unit,
     onRecharge: (Double) -> Unit,
     onSaveRechargeQr: () -> Unit,
-    onDeleteRechargeHistory: (String) -> Unit,
+    onLoadRechargeHistory: (Boolean) -> Unit,
+    onSyncRechargeHistory: () -> Unit,
+    onRechargeHistoryVisibilityChanged: (Boolean) -> Unit,
+    onDeleteRechargeHistory: (DormRechargeHistoryEntry) -> Unit,
     onCompleteRechargeQr: () -> Unit,
     onCancelRechargeQr: () -> Unit
 ) : FrameLayout(context) {
     private var state by mutableStateOf(DormElectricityUiState())
+    private var rechargeDetailVisible = false
+
+    fun isRechargeDetailVisible(): Boolean = rechargeDetailVisible
 
     init {
         setBackgroundColor(android.graphics.Color.TRANSPARENT)
@@ -146,7 +166,11 @@ internal class LiquidDormElectricityPageView(
                     onQuery = onQuery,
                     onRecharge = onRecharge,
                     onSaveRechargeQr = onSaveRechargeQr,
+                    onLoadRechargeHistory = onLoadRechargeHistory,
+                    onSyncRechargeHistory = onSyncRechargeHistory,
+                    onRechargeHistoryVisibilityChanged = onRechargeHistoryVisibilityChanged,
                     onDeleteRechargeHistory = onDeleteRechargeHistory,
+                    onRechargeDetailVisibilityChanged = { rechargeDetailVisible = it },
                     onCompleteRechargeQr = onCompleteRechargeQr,
                     onCancelRechargeQr = onCancelRechargeQr
                 )
@@ -164,7 +188,7 @@ private enum class DormPickerTarget(val title: String) {
     CAMPUS("选择校区"),
     BUILDING("选择楼栋"),
     ROOM("选择房间"),
-    EQUIPMENT("选择用电类型")
+    EQUIPMENT("选择线路")
 }
 
 @Composable
@@ -182,7 +206,11 @@ private fun DormElectricityPage(
     onQuery: () -> Unit,
     onRecharge: (Double) -> Unit,
     onSaveRechargeQr: () -> Unit,
-    onDeleteRechargeHistory: (String) -> Unit,
+    onLoadRechargeHistory: (Boolean) -> Unit,
+    onSyncRechargeHistory: () -> Unit,
+    onRechargeHistoryVisibilityChanged: (Boolean) -> Unit,
+    onDeleteRechargeHistory: (DormRechargeHistoryEntry) -> Unit,
+    onRechargeDetailVisibilityChanged: (Boolean) -> Unit,
     onCompleteRechargeQr: () -> Unit,
     onCancelRechargeQr: () -> Unit
 ) {
@@ -194,10 +222,45 @@ private fun DormElectricityPage(
     val shadow = dormTextShadow(textPalette)
     var picker by remember { mutableStateOf<DormPickerTarget?>(null) }
     var showRecharge by remember { mutableStateOf(false) }
+    val rechargeVisible = showRecharge || state.rechargeQr != null
     var showHistory by remember { mutableStateOf(false) }
+    var showReadingDetails by remember(state.campus, state.building, state.room, state.equipment) { mutableStateOf(false) }
     var selectedHistoryEntry by remember { mutableStateOf<DormRechargeHistoryEntry?>(null) }
+    val returnToHistory: () -> Unit = {
+        selectedHistoryEntry = null
+        showHistory = true
+        onRechargeDetailVisibilityChanged(false)
+    }
+    val historyVisibilityCallback by rememberUpdatedState(onRechargeHistoryVisibilityChanged)
+    DisposableEffect(showHistory, state.campus, state.building, state.room, state.equipment) {
+        historyVisibilityCallback(showHistory)
+        onDispose { historyVisibilityCallback(false) }
+    }
+    val density = LocalDensity.current
+    var rootTop by remember { mutableStateOf(0f) }
+    var resultBottom by remember { mutableStateOf<Float?>(null) }
+    var controlsTop by remember { mutableStateOf<Float?>(null) }
+    var controlsBottom by remember { mutableStateOf<Float?>(null) }
 
-    Box(Modifier.fillMaxSize()) {
+    BoxWithConstraints(Modifier.fillMaxSize().onGloballyPositioned { rootTop = it.boundsInRoot().top }) {
+        // Use the actual title/button bounds, including scroll and status-bar offsets.
+        val minimumHeight = 344.dp
+        val top = with(density) { controlsTop?.let { (it - rootTop).toDp() - 10.dp } }
+            ?: (maxHeight * 0.43f)
+        val formTop = top.coerceIn(16.dp, (maxHeight - minimumHeight - 16.dp).coerceAtLeast(16.dp))
+        val bottom = with(density) { controlsBottom?.let { (it - rootTop).toDp() + 10.dp } }
+            ?: (formTop + minimumHeight)
+        val formHeight = (bottom - formTop).coerceAtLeast(minimumHeight)
+            .coerceAtMost((maxHeight - formTop - 16.dp).coerceAtLeast(1.dp))
+        val formCardModifier = Modifier.padding(horizontal = DormRechargeDialogHorizontalPadding)
+            .offset(y = formTop).fillMaxWidth().height(formHeight)
+        // Anchor the compact amount card below the actual balance card, over the dorm title.
+        val amountTop = (with(density) { resultBottom?.let { (it - rootTop).toDp() + 8.dp } } ?: top)
+            .coerceIn(16.dp, (maxHeight - 260.dp - 16.dp).coerceAtLeast(16.dp))
+        val amountAvailableHeight = (maxHeight - amountTop - 16.dp).coerceAtLeast(1.dp)
+        val amountCardModifier = Modifier.padding(horizontal = DormRechargeDialogHorizontalPadding)
+            .offset(y = amountTop).fillMaxWidth()
+            .heightIn(min = 260.dp.coerceAtMost(amountAvailableHeight), max = amountAvailableHeight)
         PageAlignedBackdropSource(
             backdrop = backdrop,
             pageBackgroundImage = background,
@@ -213,12 +276,16 @@ private fun DormElectricityPage(
                 DormHeader(primary, shadow, state.loading != null, onBack, onRefresh)
             }
             item("dorm_result") {
-                DormResultCard(backdrop, state, primary, secondary, shadow) { showRecharge = true }
+                Box(Modifier.onGloballyPositioned { resultBottom = it.boundsInRoot().bottom }) {
+                    DormResultCard(backdrop, state, primary, secondary, shadow,
+                        onRecharge = { showRecharge = true }, onDetails = { showReadingDetails = true })
+                }
             }
             item("dorm_condition_title") {
                 androidx.compose.foundation.text.BasicText(
                     "宿舍信息",
-                    modifier = Modifier.padding(start = 4.dp, top = 2.dp),
+                    modifier = Modifier.onGloballyPositioned { controlsTop = it.boundsInRoot().top }
+                        .padding(start = 4.dp, top = 2.dp),
                     style = TextStyle(primary, 20.sp, FontWeight.ExtraBold, shadow = shadow)
                 )
             }
@@ -259,7 +326,7 @@ private fun DormElectricityPage(
                         ) { picker = DormPickerTarget.ROOM }
                         DormSelector(
                             backdrop,
-                            "用电类型",
+                            "线路",
                             state.equipment?.label ?: "请选择",
                             state.equipmentTypes.isNotEmpty(),
                             Modifier.weight(1f),
@@ -278,7 +345,7 @@ private fun DormElectricityPage(
                     enabled = state.campus != null && state.building != null && state.room != null &&
                         state.equipment != null && state.loading == null,
                     allowDragDeformation = false,
-                    modifier = Modifier.fillMaxWidth(),
+                    modifier = Modifier.fillMaxWidth().onGloballyPositioned { controlsBottom = it.boundsInRoot().bottom },
                     height = 54.dp
                 ) {
                     androidx.compose.foundation.text.BasicText(
@@ -332,33 +399,40 @@ private fun DormElectricityPage(
         }
 
         AnimatedVisibility(
-            visible = showRecharge || state.rechargeQr != null,
+            visible = rechargeVisible,
             enter = fadeIn() + scaleIn(initialScale = 0.96f),
-            exit = fadeOut() + scaleOut(targetScale = 0.96f)
+            exit = ExitTransition.None
         ) {
-            DormRechargeDialog(
-                backdrop = backdrop,
-                state = state,
-                primary = primary,
-                secondary = secondary,
-                shadow = shadow,
-                onCancel = {
-                    showRecharge = false
-                    onCancelRechargeQr()
-                },
-                onComplete = {
-                    showRecharge = false
-                    onCompleteRechargeQr()
-                },
-                onRecharge = onRecharge,
-                onSaveRechargeQr = onSaveRechargeQr
-            )
+            // Do not compose the amount fallback after clearing QR data, even during an interrupted enter animation.
+            if (rechargeVisible) {
+                DormRechargeDialog(
+                    backdrop = backdrop,
+                    state = state,
+                    amountCardModifier = amountCardModifier,
+                    primary = primary,
+                    secondary = secondary,
+                    shadow = shadow,
+                    onCancel = {
+                        showRecharge = false
+                        onCancelRechargeQr()
+                    },
+                    onComplete = {
+                        showRecharge = false
+                        onCompleteRechargeQr()
+                    },
+                    onRecharge = onRecharge,
+                    onSaveRechargeQr = onSaveRechargeQr
+                )
+            }
         }
 
         DormHistoryButton(
             backdrop = backdrop,
             modifier = Modifier.align(Alignment.BottomEnd).padding(end = 22.dp, bottom = 24.dp),
-            onClick = { showHistory = true }
+            onClick = {
+                showHistory = true
+                onLoadRechargeHistory(true)
+            }
         )
 
         AnimatedVisibility(
@@ -368,13 +442,29 @@ private fun DormElectricityPage(
         ) {
             DormRechargeHistoryDialog(
                 backdrop = backdrop,
-                entries = state.rechargeHistory,
+                state = state,
                 primary = primary,
                 secondary = secondary,
                 shadow = shadow,
                 onDismiss = { showHistory = false },
-                onEntryClick = { selectedHistoryEntry = it }
+                onEntryClick = {
+                    selectedHistoryEntry = it
+                    onRechargeDetailVisibilityChanged(true)
+                },
+                onLoad = onLoadRechargeHistory,
+                onSync = onSyncRechargeHistory
             )
+        }
+
+        AnimatedVisibility(
+            visible = showReadingDetails && state.reading != null,
+            enter = fadeIn() + scaleIn(initialScale = 0.96f),
+            exit = fadeOut() + scaleOut(targetScale = 0.96f)
+        ) {
+            state.reading?.let { reading ->
+                DormReadingDetailDialog(backdrop, reading, state.lastQuery, formCardModifier,
+                    primary, secondary, shadow) { showReadingDetails = false }
+            }
         }
 
         AnimatedVisibility(
@@ -385,14 +475,16 @@ private fun DormElectricityPage(
             selectedHistoryEntry?.let { entry ->
                 DormRechargeHistoryDetailDialog(
                     backdrop = backdrop,
-                    entry = entry,
+                    entry = state.rechargeHistory.firstOrNull { it.id == entry.id } ?: entry,
                     primary = primary,
                     secondary = secondary,
                     shadow = shadow,
-                    onDismiss = { selectedHistoryEntry = null },
+                    onDismiss = returnToHistory,
                     onDelete = {
-                        selectedHistoryEntry = null
-                        onDeleteRechargeHistory(entry.id)
+                        if (selectedHistoryEntry?.orderId == entry.orderId) {
+                            onDeleteRechargeHistory(entry)
+                            returnToHistory()
+                        }
                     }
                 )
             }
@@ -445,7 +537,8 @@ private fun DormResultCard(
     primary: Color,
     secondary: Color,
     shadow: Shadow?,
-    onRecharge: () -> Unit
+    onRecharge: () -> Unit,
+    onDetails: () -> Unit
 ) {
     val theme = CampusComposeTheme.colors
     Column(
@@ -465,6 +558,8 @@ private fun DormResultCard(
                 onDrawSurface = { drawRect(theme.glassSurface) }
             )
             .border(1.dp, dormOutlineColor(theme.isDark), RoundedCornerShape(26.dp))
+            .clip(RoundedCornerShape(26.dp))
+            .clickable(enabled = state.reading != null && state.loading == null, onClick = onDetails)
             .padding(horizontal = 23.dp, vertical = 22.dp),
         verticalArrangement = Arrangement.spacedBy(10.dp)
     ) {
@@ -474,7 +569,7 @@ private fun DormResultCard(
             verticalAlignment = Alignment.CenterVertically
         ) {
             androidx.compose.foundation.text.BasicText(
-                "剩余电量",
+                "剩余总电量",
                 style = TextStyle(secondary, 14.sp, FontWeight.SemiBold, shadow = shadow)
             )
             if (state.reading != null) {
@@ -503,8 +598,6 @@ private fun DormResultCard(
                 }
             }
             state.reading != null -> {
-                val normalSupply = state.reading.supplyStatus.trim() == "正常供电"
-                val supplyColor = if (normalSupply) Color(0xFF469A69) else Color(0xFFC4646C)
                 Row(verticalAlignment = Alignment.Bottom) {
                     androidx.compose.foundation.text.BasicText(
                         String.format(Locale.US, "%.2f", state.reading.remainingKwh),
@@ -519,7 +612,10 @@ private fun DormResultCard(
                 }
                 androidx.compose.foundation.text.BasicText(
                     state.reading.supplyStatus,
-                    style = TextStyle(supplyColor, 17.sp, FontWeight.Bold, shadow = shadow)
+                    style = TextStyle(
+                        if (state.reading.supplyStatus.trim() == "正常供电") Color(0xFF469A69) else Color(0xFFC4646C),
+                        17.sp, FontWeight.Bold, shadow = shadow
+                    )
                 )
                 androidx.compose.foundation.text.BasicText(
                     state.reading.location,
@@ -611,6 +707,7 @@ private fun DormSelector(
 private fun DormRechargeDialog(
     backdrop: Backdrop,
     state: DormElectricityUiState,
+    amountCardModifier: Modifier,
     primary: Color,
     secondary: Color,
     shadow: Shadow?,
@@ -635,12 +732,10 @@ private fun DormRechargeDialog(
             indication = null,
             onClick = onCancel
         ),
-        contentAlignment = Alignment.Center
+        contentAlignment = if (qrBitmap == null) Alignment.TopCenter else Alignment.Center
     ) {
         Column(
-            Modifier
-                .padding(horizontal = 28.dp)
-                .fillMaxWidth()
+            (if (qrBitmap == null) amountCardModifier else Modifier.padding(horizontal = 28.dp).fillMaxWidth())
                 .drawBackdrop(
                     backdrop = backdrop,
                     shape = { RoundedRectangle(30.dp) },
@@ -658,9 +753,10 @@ private fun DormRechargeDialog(
                 )
                 .clip(RoundedCornerShape(30.dp))
                 .clickable(interactionSource = null, indication = null, onClick = {})
-                .padding(horizontal = 24.dp, vertical = 24.dp),
+                .padding(horizontal = 24.dp, vertical = 24.dp)
+                .verticalScroll(rememberScrollState()),
             horizontalAlignment = Alignment.CenterHorizontally,
-            verticalArrangement = Arrangement.spacedBy(16.dp)
+            verticalArrangement = if (qrBitmap == null) Arrangement.SpaceBetween else Arrangement.spacedBy(16.dp)
         ) {
             if (qrBitmap == null) {
                 androidx.compose.foundation.text.BasicText(
@@ -701,7 +797,7 @@ private fun DormRechargeDialog(
                     style = TextStyle(primary, 17.sp, FontWeight.Bold, shadow = shadow)
                 )
                 androidx.compose.foundation.text.BasicText(
-                    "请使用中国建设银行APP扫码完成充值",
+                    "请使用微信或支付宝扫码完成充值",
                     style = TextStyle(secondary, 13.sp, FontWeight.Medium, shadow = shadow)
                 )
                 Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(12.dp)) {
@@ -731,10 +827,11 @@ private fun DormRechargeDialog(
                     }
                 }
             } else {
+                Spacer(Modifier.height(16.dp))
                 BasicTextField(
                     value = amountText,
                     onValueChange = { value ->
-                        if (value.length <= 7 && value.matches(Regex("\\d{0,3}(\\.\\d{0,2})?"))) {
+                        if (value.length <= 7 && value.matches(Regex("\\d{0,4}(\\.\\d{0,2})?"))) {
                             amountText = value
                             inputError = null
                         }
@@ -777,6 +874,7 @@ private fun DormRechargeDialog(
                         style = TextStyle(theme.error, 13.sp, FontWeight.SemiBold, shadow = shadow)
                     )
                 }
+                Spacer(Modifier.height(16.dp))
                 Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(12.dp)) {
                     QuietDialogAction(
                         label = "取消",
@@ -789,8 +887,8 @@ private fun DormRechargeDialog(
                     CampusLiquidButton(
                         onClick = {
                             val amount = amountText.toDoubleOrNull()
-                            if (amount == null || amount <= 0.0 || amount > 100.0) {
-                                inputError = "请输入 0.01～100 元的充值金额"
+                            if (amount == null || !amount.isFinite() || amount < 0.01 || amount > 4000.0) {
+                                inputError = "请输入 0.01～4000 元的充值金额"
                             } else {
                                 onRecharge(amount)
                             }
@@ -805,7 +903,7 @@ private fun DormRechargeDialog(
                         height = 50.dp
                     ) {
                         if (state.loading == DormElectricityLoading.RECHARGE) {
-                            DormSpinner(size = 22.dp, strokeWidth = 2.4.dp)
+                            DormSpinner(size = 22.dp, strokeWidth = 2.4.dp, color = Color.White)
                         } else {
                             androidx.compose.foundation.text.BasicText(
                                 "确认",
@@ -837,8 +935,7 @@ private fun DormPicker(
     val visibleOptions = remember(options, searchText, searchableRoom) {
         if (!searchableRoom || searchText.isBlank()) options
         else options.filter { option ->
-            option.label.filter(Char::isDigit).contains(searchText) ||
-                option.code.filter(Char::isDigit).contains(searchText)
+            option.label.substringBefore('（').filter(Char::isDigit).contains(searchText)
         }
     }
     Box(
@@ -983,15 +1080,18 @@ private fun DormHistoryButton(backdrop: Backdrop, modifier: Modifier, onClick: (
 @Composable
 private fun DormRechargeHistoryDialog(
     backdrop: Backdrop,
-    entries: List<DormRechargeHistoryEntry>,
+    state: DormElectricityUiState,
     primary: Color,
     secondary: Color,
     shadow: Shadow?,
     onDismiss: () -> Unit,
-    onEntryClick: (DormRechargeHistoryEntry) -> Unit
+    onEntryClick: (DormRechargeHistoryEntry) -> Unit,
+    onLoad: (Boolean) -> Unit,
+    onSync: () -> Unit
 ) {
     val theme = CampusComposeTheme.colors
-    val dateFormatter = remember { SimpleDateFormat("yyyy-MM-dd HH:mm", Locale.CHINA) }
+    val entries = state.rechargeHistory
+    BackHandler(onBack = onDismiss)
     Box(
         Modifier.fillMaxSize().clickable(interactionSource = null, indication = null, onClick = onDismiss),
         contentAlignment = Alignment.Center
@@ -1016,18 +1116,31 @@ private fun DormRechargeHistoryDialog(
                 )
                 .clip(RoundedCornerShape(30.dp))
                 .clickable(interactionSource = null, indication = null, onClick = {})
-                .padding(horizontal = 20.dp, vertical = 22.dp),
+                .padding(start = DormRechargeDialogContentPadding, end = DormRechargeDialogContentPadding,
+                    top = DormRechargeDialogTitleTopPadding, bottom = 22.dp),
             verticalArrangement = Arrangement.spacedBy(13.dp)
         ) {
-            androidx.compose.foundation.text.BasicText(
-                "充值记录",
-                style = TextStyle(primary, 24.sp, FontWeight.ExtraBold, shadow = shadow)
-            )
-            if (entries.isEmpty()) {
-                Box(Modifier.fillMaxWidth().weight(1f), contentAlignment = Alignment.Center) {
+            DormRechargeDialogHeader("充值记录", primary, shadow) {
+                androidx.compose.foundation.text.BasicText(
+                    "同步",
+                    modifier = Modifier.clip(CircleShape).clickable(enabled = !state.historyLoading, onClick = onSync)
+                        .padding(10.dp),
+                    style = TextStyle(theme.accent, 14.sp, FontWeight.Bold)
+                )
+            }
+            if (entries.isEmpty() && state.historyLoading) {
+                Box(Modifier.fillMaxWidth().weight(1f), contentAlignment = Alignment.Center) { DormSpinner() }
+            } else if (entries.isEmpty()) {
+                Column(Modifier.fillMaxWidth().weight(1f), horizontalAlignment = Alignment.CenterHorizontally,
+                    verticalArrangement = Arrangement.Center) {
                     androidx.compose.foundation.text.BasicText(
-                        "暂无充值记录",
+                        state.historyError ?: "暂无充值记录",
                         style = TextStyle(secondary, 15.sp, FontWeight.Medium, shadow = shadow)
+                    )
+                    if (state.historyHasMore) androidx.compose.foundation.text.BasicText(
+                        "加载更多",
+                        modifier = Modifier.clickable { onLoad(false) }.padding(16.dp),
+                        style = TextStyle(theme.accent, 14.sp, FontWeight.Bold)
                     )
                 }
             } else {
@@ -1061,14 +1174,27 @@ private fun DormRechargeHistoryDialog(
                             }
                             Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
                                 androidx.compose.foundation.text.BasicText(
-                                    dateFormatter.format(Date(entry.createdAt)),
+                                    entry.createdAt.replace('T', ' ').take(16),
                                     style = TextStyle(secondary, 12.sp, FontWeight.Medium, shadow = shadow)
                                 )
                                 androidx.compose.foundation.text.BasicText(
-                                    entry.addedKwh?.let { String.format(Locale.US, "+%.2f kWh", it) } ?: "等待充值后查询",
-                                    style = TextStyle(secondary, 12.sp, FontWeight.SemiBold, shadow = shadow)
+                                    entry.summary,
+                                    style = TextStyle(dormRechargeStatusColor(entry, secondary), 12.sp, FontWeight.SemiBold, shadow = shadow)
                                 )
                             }
+                        }
+                    }
+                    item("history_footer") {
+                        Box(Modifier.fillMaxWidth().padding(vertical = 10.dp), contentAlignment = Alignment.Center) {
+                            if (state.historyLoading) DormSpinner(size = 24.dp, strokeWidth = 2.dp)
+                            else androidx.compose.foundation.text.BasicText(
+                                state.historyError?.let { "加载失败，点击重试" }
+                                    ?: if (state.historyHasMore) "加载更多" else "已显示全部记录",
+                                modifier = Modifier.clickable(enabled = state.historyHasMore || state.historyError != null) {
+                                    onLoad(state.historyError != null)
+                                }.padding(8.dp),
+                                style = TextStyle(if (state.historyHasMore || state.historyError != null) theme.accent else secondary, 13.sp)
+                            )
                         }
                     }
                 }
@@ -1080,7 +1206,8 @@ private fun DormRechargeHistoryDialog(
 @Composable
 private fun DormRechargeDetailCloseButton(
     backdrop: Backdrop,
-    onClick: () -> Unit
+    onClick: () -> Unit,
+    description: String = "关闭充值详情"
 ) {
     val theme = CampusComposeTheme.colors
     Box(
@@ -1104,7 +1231,7 @@ private fun DormRechargeDetailCloseButton(
             .border(1.dp, dormOutlineColor(theme.isDark), CircleShape)
             .clip(CircleShape)
             .clickable(onClick = onClick)
-            .semantics { contentDescription = "关闭充值详情" },
+            .semantics { contentDescription = description },
         contentAlignment = Alignment.Center
     ) {
         Canvas(Modifier.size(17.dp)) {
@@ -1138,9 +1265,10 @@ private fun DormRechargeHistoryDetailDialog(
     onDelete: () -> Unit
 ) {
     val theme = CampusComposeTheme.colors
-    val dateFormatter = remember { SimpleDateFormat("yyyy-MM-dd HH:mm", Locale.CHINA) }
+    // Only explicit close/delete actions leave details; outside taps and system Back do not.
+    BackHandler(onBack = {})
     Box(
-        Modifier.fillMaxSize().clickable(interactionSource = null, indication = null, onClick = onDismiss),
+        Modifier.fillMaxSize().clickable(interactionSource = null, indication = null, onClick = {}),
         contentAlignment = Alignment.Center
     ) {
         Column(
@@ -1166,63 +1294,120 @@ private fun DormRechargeHistoryDetailDialog(
                 )
                 .clip(RoundedCornerShape(30.dp))
                 .clickable(interactionSource = null, indication = null, onClick = {})
-                .padding(horizontal = 22.dp, vertical = 22.dp),
-            verticalArrangement = Arrangement.spacedBy(10.dp)
+                .padding(start = DormRechargeDialogContentPadding, end = DormRechargeDialogContentPadding,
+                    top = DormRechargeDialogTitleTopPadding, bottom = 20.dp)
         ) {
-            Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-                androidx.compose.foundation.text.BasicText(
-                    "充值详情",
-                    modifier = Modifier.weight(1f),
-                    style = TextStyle(primary, 24.sp, FontWeight.ExtraBold, shadow = shadow)
-                )
+            DormRechargeDialogHeader("充值详情", primary, shadow) {
                 DormRechargeDetailCloseButton(backdrop = backdrop, onClick = onDismiss)
             }
-            DormRechargeDetailRow("充值宿舍", entry.location, primary, secondary, shadow)
-            DormRechargeDetailRow(
-                "充值时间",
-                dateFormatter.format(Date(entry.createdAt)),
-                primary,
-                secondary,
-                shadow
-            )
-            DormRechargeDetailRow(
-                "充值金额",
-                String.format(Locale.US, "¥%.2f", entry.amount),
-                primary,
-                secondary,
-                shadow
-            )
-            DormRechargeDetailRow(
-                "充值前电量",
-                entry.beforeKwh?.let { String.format(Locale.US, "%.2f kWh", it) } ?: "未记录",
-                primary,
-                secondary,
-                shadow
-            )
-            DormRechargeDetailRow(
-                "充值后电量",
-                entry.afterKwh?.let { String.format(Locale.US, "%.2f kWh", it) } ?: "等待充值后查询",
-                primary,
-                secondary,
-                shadow
-            )
-            DormRechargeDetailRow(
-                "充值度数",
-                entry.addedKwh?.let { String.format(Locale.US, "+%.2f kWh", it) } ?: "等待充值后查询",
-                primary,
-                secondary,
-                shadow
-            )
-            Spacer(Modifier.weight(1f))
-            QuietDialogAction(
-                label = "删除记录",
-                foreground = theme.error,
-                enabled = true,
-                onClick = onDelete,
-                modifier = Modifier.fillMaxWidth(),
-                height = 50.dp
-            )
+            Spacer(Modifier.height(24.dp))
+            LazyColumn(Modifier.fillMaxWidth().weight(1f), verticalArrangement = Arrangement.spacedBy(14.dp)) {
+                item { DormRechargeDetailRow("充值宿舍", entry.location, primary, secondary, shadow) }
+                item { DormRechargeDetailRow("订单号", entry.orderId, primary, secondary, shadow, allowWrap = true) }
+                item {
+                    DormRechargeDetailRow("支付时间", entry.paidAt.replace('T', ' ').ifBlank { "暂无支付时间" }, primary, secondary, shadow)
+                }
+                item { DormRechargeDetailRow("缴费金额", String.format(Locale.US, "¥%.2f", entry.amount), primary, secondary, shadow) }
+                item { DormRechargeDetailRow("充值状态", entry.processingLabel, dormRechargeStatusColor(entry, secondary), secondary, shadow) }
+                item { DormRechargeDetailRow("充值前电量", entry.beforeTotalKwh?.let { String.format(Locale.US, "%.2f kWh", it) }
+                    ?: "暂无电量数据", primary, secondary, shadow) }
+                item { DormRechargeDetailRow("充值度数", entry.rechargedKwh?.let(::formatDormRechargeDelta)
+                    ?: if (entry.credited) "暂无电量数据" else "等待充值成功", primary, secondary, shadow) }
+            }
+            Spacer(Modifier.height(16.dp))
+            QuietDialogAction("删除记录", Color(0xFFC4646C), true,
+                onDelete, Modifier.fillMaxWidth(), height = 50.dp)
         }
+    }
+}
+
+@Composable
+private fun DormReadingDetailDialog(
+    backdrop: Backdrop,
+    reading: DormElectricityReading,
+    lastQuery: DormQuerySnapshot?,
+    formCardModifier: Modifier,
+    primary: Color,
+    secondary: Color,
+    shadow: Shadow?,
+    onDismiss: () -> Unit
+) {
+    val theme = CampusComposeTheme.colors
+    BackHandler(onBack = onDismiss)
+    Box(Modifier.fillMaxSize().clickable(interactionSource = null, indication = null, onClick = onDismiss),
+        contentAlignment = Alignment.TopCenter) {
+        Column(
+            formCardModifier
+                .drawBackdrop(
+                    backdrop = backdrop,
+                    shape = { RoundedRectangle(30.dp) },
+                    effects = {
+                        vibrancy()
+                        colorControls(brightness = if (theme.isDark) 0f else 0.12f, saturation = if (theme.isDark) 0.46f else 0.62f)
+                        lens(18.dp.toPx(), 36.dp.toPx())
+                    },
+                    shadow = null,
+                    highlight = { Highlight.Default.copy(alpha = if (theme.isDark) 0.18f else 0.58f) },
+                    onDrawSurface = { drawRect(theme.glassStrongSurface) }
+                )
+                .clip(RoundedCornerShape(30.dp))
+                .clickable(interactionSource = null, indication = null, onClick = {})
+                .padding(horizontal = 22.dp, vertical = 24.dp)
+                .verticalScroll(rememberScrollState()),
+            verticalArrangement = Arrangement.spacedBy(24.dp)
+        ) {
+            Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                androidx.compose.foundation.text.BasicText("电量明细", Modifier.weight(1f),
+                    style = TextStyle(primary, 24.sp, FontWeight.ExtraBold, shadow = shadow))
+            }
+            DormReadingDetailRow("免费电量", String.format(Locale.US, "%.2f kWh", reading.freeKwh), primary, secondary, shadow)
+            DormReadingDetailRow("付费电量", String.format(Locale.US, "%.2f kWh", reading.paidKwh), primary, secondary, shadow)
+            DormReadingDetailRow("欠费电量", String.format(Locale.US, "%.2f kWh", reading.arrearsKwh), primary, secondary, shadow)
+            DormReadingDetailRow("上次查询日期", lastQuery?.let {
+                java.text.SimpleDateFormat("yyyy-MM-dd HH:mm", Locale.CHINA).format(java.util.Date(it.queriedAt))
+            } ?: "暂无查询记录", primary, secondary, shadow)
+            DormReadingDetailRow("上次查询电量", lastQuery?.let { String.format(Locale.US, "%.2f kWh", it.remainingKwh) }
+                ?: "暂无查询记录", primary, secondary, shadow)
+        }
+    }
+}
+
+@Composable
+private fun DormReadingDetailRow(label: String, value: String, primary: Color, secondary: Color, shadow: Shadow?) {
+    Row(Modifier.fillMaxWidth().heightIn(min = 26.dp), horizontalArrangement = Arrangement.spacedBy(12.dp),
+        verticalAlignment = Alignment.CenterVertically) {
+        androidx.compose.foundation.text.BasicText(label, Modifier.width(100.dp), maxLines = 1,
+            autoSize = TextAutoSize.StepBased(13.sp, 16.sp, 0.5.sp),
+            style = TextStyle(secondary, 16.sp, FontWeight.Medium, shadow = shadow))
+        androidx.compose.foundation.text.BasicText(value, Modifier.weight(1f), maxLines = 1,
+            autoSize = TextAutoSize.StepBased(13.sp, 18.sp, 0.5.sp),
+            style = TextStyle(primary, 18.sp, FontWeight.SemiBold, shadow = shadow))
+    }
+}
+
+private fun dormRechargeStatusColor(entry: DormRechargeHistoryEntry, fallback: Color): Color =
+    when (entry.processingStatus) {
+        "0" -> Color(0xFFC4646C)
+        "1" -> Color(0xFF398BE5)
+        "2" -> Color(0xFF469A69)
+        else -> fallback
+    }
+
+@Composable
+private fun DormRechargeDialogHeader(
+    title: String,
+    primary: Color,
+    shadow: Shadow?,
+    action: @Composable () -> Unit
+) {
+    Row(Modifier.fillMaxWidth().heightIn(min = 44.dp), verticalAlignment = Alignment.CenterVertically) {
+        androidx.compose.foundation.text.BasicText(
+            title,
+            modifier = Modifier.weight(1f),
+            maxLines = 1,
+            style = TextStyle(primary, 24.sp, FontWeight.ExtraBold, shadow = shadow)
+        )
+        action()
     }
 }
 
@@ -1232,33 +1417,41 @@ private fun DormRechargeDetailRow(
     value: String,
     primary: Color,
     secondary: Color,
-    shadow: Shadow?
+    shadow: Shadow?,
+    allowWrap: Boolean = false
 ) {
     Row(
         Modifier.fillMaxWidth(),
-        horizontalArrangement = Arrangement.spacedBy(16.dp),
-        verticalAlignment = Alignment.Top
+        horizontalArrangement = Arrangement.spacedBy(10.dp),
+        verticalAlignment = if (allowWrap) Alignment.Top else Alignment.CenterVertically
     ) {
         androidx.compose.foundation.text.BasicText(
             label,
-            modifier = Modifier.width(84.dp),
+            modifier = Modifier.width(64.dp),
+            maxLines = 1,
+            autoSize = TextAutoSize.StepBased(11.sp, 13.sp, 0.5.sp),
             style = TextStyle(secondary, 13.sp, FontWeight.Medium, shadow = shadow)
         )
         androidx.compose.foundation.text.BasicText(
             value,
             modifier = Modifier.weight(1f),
+            maxLines = if (allowWrap) Int.MAX_VALUE else 1,
+            softWrap = allowWrap,
+            overflow = if (allowWrap) TextOverflow.Clip else TextOverflow.Ellipsis,
+            autoSize = if (allowWrap) null else TextAutoSize.StepBased(minFontSize = 10.sp, maxFontSize = 15.sp, stepSize = 0.5.sp),
             style = TextStyle(primary, 15.sp, FontWeight.SemiBold, shadow = shadow)
         )
     }
 }
 
 @Composable
-private fun DormSpinner(size: Dp = 38.dp, strokeWidth: Dp = 4.dp) {
+private fun DormSpinner(size: Dp = 38.dp, strokeWidth: Dp = 4.dp, color: Color = CampusComposeTheme.colors.accent) {
     CampusLoadingSpinner(
         label = "dormElectricityLoading",
         rotationLabel = "dormElectricityRotation",
         size = size,
-        strokeWidth = strokeWidth
+        strokeWidth = strokeWidth,
+        color = color
     )
 }
 

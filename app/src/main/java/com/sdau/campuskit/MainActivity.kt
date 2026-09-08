@@ -256,14 +256,33 @@ class MainActivity : ComponentActivity() {
     private var refreshScheduleConfirmOverlay: LiquidConfirmDialogView? = null
     private var dormElectricityOverlay: LiquidDormElectricityPageView? = null
     private val dormElectricityRepository = DormElectricityRepository()
-    private val dormPaymentQrResolver by lazy { DormPaymentQrResolver(this) }
-    private val dormRechargeHistoryStore by lazy { DormRechargeHistoryStore(applicationContext) }
+    private val dormRechargeAnnotations by lazy {
+        val preferences = getSharedPreferences("dorm_recharge_annotations", MODE_PRIVATE)
+        DormRechargeAnnotations(
+            read = { preferences.getString("annotations", "{}").orEmpty() },
+            write = { preferences.edit().putString("annotations", it).apply() }
+        )
+    }
+    private val dormPaymentQrResolver by lazy { DormPaymentQrResolver() }
+    private val dormQueryHistory by lazy {
+        val preferences = getSharedPreferences("dorm_query_samples", MODE_PRIVATE)
+        DormQueryHistory({ preferences.getString("samples", "{}").orEmpty() },
+            { preferences.edit().putString("samples", it).apply() })
+    }
+    @Volatile private var dormHistoryRequestGeneration = 0
+    @Volatile private var dormHistoryPollGeneration = 0
+    private var dormHistoryVisible = false
+    private var dormPageResumed = false
+    private var dormHistoryPollRunning = false
+    private var dormHistoryPollRunnable: Runnable? = null
+    private var dormHistoryPollTargets = DormHistoryPollTargets()
+    private var dormHistoryPage = 0
     private var dormElectricityState = DormElectricityUiState()
     private var dormElectricityRequestGeneration = 0
     private var dormRechargeVerificationRunning = false
     private var dormRechargeVerificationGeneration = 0
     private var dormRechargeVerificationRunnable: Runnable? = null
-    private var pendingDormRechargeHistoryEntry: DormRechargeHistoryEntry? = null
+    private var pendingDormPayment: DormPendingPayment? = null
     private var shareOverlay: View? = null
     private var actionMenuOverlay: LiquidActionMenuView? = null
     private var backgroundEditorOverlay: LiquidBackgroundEditorView? = null
@@ -3610,19 +3629,15 @@ class MainActivity : ComponentActivity() {
 
     private fun showDormElectricityPage() {
         if (dormElectricityOverlay != null) return
-        lateinit var page: LiquidDormElectricityPageView
-        page = LiquidDormElectricityPageView(
+        val page = LiquidDormElectricityPageView(
             context = this,
             pageBackgroundBitmap = currentPageBackgroundBitmap,
             pageBackgroundScrim = customBackgroundScrimColor(),
             textPalette = scheduleTextPalette,
-            onBack = { hideDormElectricityPage() },
+            onBack = ::hideDormElectricityPage,
             onRefresh = {
                 dormElectricityPreferences().edit().clear().apply()
-                loadDormCampuses(
-                    restoreSelection = false,
-                    preferredCampusLabel = inferDormCampusFromSchedule()
-                )
+                loadDormCampuses(false, inferDormCampusFromSchedule())
             },
             onCampusSelected = ::selectDormCampus,
             onBuildingSelected = ::selectDormBuilding,
@@ -3631,6 +3646,9 @@ class MainActivity : ComponentActivity() {
             onQuery = ::queryDormElectricity,
             onRecharge = ::rechargeDormElectricity,
             onSaveRechargeQr = ::saveDormRechargeQrToGallery,
+            onLoadRechargeHistory = ::loadDormRechargeHistory,
+            onSyncRechargeHistory = ::syncDormRechargeHistory,
+            onRechargeHistoryVisibilityChanged = ::setDormHistoryVisible,
             onDeleteRechargeHistory = ::deleteDormRechargeHistory,
             onCompleteRechargeQr = ::completeDormRechargeQr,
             onCancelRechargeQr = ::cancelDormRechargeQr
@@ -3642,31 +3660,14 @@ class MainActivity : ComponentActivity() {
         page.alpha = 0f
         page.animate().alpha(1f).setDuration(220L).start()
         loadDormCampuses(restoreSelection = true)
-        networkExecutor.execute {
-            val history = dormRechargeHistoryStore.load()
-            runOnUiThread {
-                if (dormElectricityOverlay === page) {
-                    updateDormElectricityState { it.copy(rechargeHistory = history) }
-                }
-            }
-        }
     }
 
     private fun hideDormElectricityPage() {
         val overlay = dormElectricityOverlay ?: return
         dormElectricityOverlay = null
-        dormElectricityRequestGeneration++
-        dormRechargeVerificationGeneration++
-        dormRechargeVerificationRunnable?.let(window.decorView::removeCallbacks)
-        dormRechargeVerificationRunnable = null
-        dormRechargeVerificationRunning = false
-        pendingDormRechargeHistoryEntry = null
-        dormPaymentQrResolver.cancel()
-        overlay.animate()
-            .alpha(0f)
-            .setDuration(180L)
-            .withEndAction { pageHost.removeView(overlay) }
-            .start()
+        invalidateDormRequests()
+        overlay.animate().alpha(0f).setDuration(180L)
+            .withEndAction { pageHost.removeView(overlay) }.start()
     }
 
     private fun updateDormElectricityState(transform: (DormElectricityUiState) -> DormElectricityUiState) {
@@ -3674,94 +3675,67 @@ class MainActivity : ComponentActivity() {
         dormElectricityOverlay?.render(dormElectricityState)
     }
 
-    private fun deleteDormRechargeHistory(id: String) {
-        networkExecutor.execute {
-            val updated = dormRechargeHistoryStore.load().filterNot { it.id == id }
-            dormRechargeHistoryStore.save(updated)
-            runOnUiThread {
-                updateDormElectricityState { state ->
-                    state.copy(rechargeHistory = state.rechargeHistory.filterNot { it.id == id })
-                }
-            }
-        }
+    /** Invalidate all callbacks before changing room/line; a previous room must never overwrite this one. */
+    private fun invalidateDormRequests() {
+        stopDormHistoryPolling()
+        dormHistoryVisible = false
+        dormHistoryPollTargets = DormHistoryPollTargets()
+        dormElectricityRequestGeneration++
+        dormHistoryRequestGeneration++
+        dormHistoryPage = 0
+        dormRechargeVerificationGeneration++
+        dormRechargeVerificationRunnable?.let(window.decorView::removeCallbacks)
+        dormRechargeVerificationRunnable = null
+        dormRechargeVerificationRunning = false
+        pendingDormPayment = null
+        dormPaymentQrResolver.cancel()
     }
 
-    private fun dormElectricityPreferences() =
-        getSharedPreferences("dorm_electricity", MODE_PRIVATE)
+    private fun clearDormResult(state: DormElectricityUiState) = state.copy(
+        reading = null, lastQuery = null, error = null, rechargeQr = null, rechargeError = null,
+        rechargeHistory = emptyList(), historyLoading = false, historyError = null, historyHasMore = false
+    )
+
+    private fun dormElectricityPreferences() = getSharedPreferences("dorm_electricity", MODE_PRIVATE)
 
     private fun restoredDormElectricityState(): DormElectricityUiState {
         val preferences = dormElectricityPreferences()
-        fun savedOption(codeKey: String, labelKey: String): DormElectricityOption? {
-            val code = preferences.getString(codeKey, null).orEmpty()
-            val label = preferences.getString(labelKey, null).orEmpty()
+        fun savedOption(key: String): DormElectricityOption? {
+            val code = preferences.getString("${key}_code", null).orEmpty()
+            val label = preferences.getString("${key}_label", null).orEmpty()
             return if (code.isBlank() || label.isBlank()) null else DormElectricityOption(label, code)
         }
-
-        val campus = savedOption("campus_code", "campus_label")
-        val building = savedOption("building_code", "building_label")
-        val room = savedOption("room_code", "room_label")
-        val equipmentTypes = if (campus != null && building != null) {
-            DormElectricityPolicy.equipmentTypes(campus.code, building.label)
-        } else {
-            DormElectricityPolicy.defaultTypes
-        }
-        val savedEquipment = savedOption("equipment_code", "equipment_label")
-        val equipment = equipmentTypes.firstOrNull { it.code == savedEquipment?.code }
-            ?: savedEquipment
-            ?: equipmentTypes.firstOrNull()
+        val campus = savedOption("campus")
+        val building = savedOption("building")
+        val room = savedOption("room")
+        val equipment = savedOption("equipment")
         return DormElectricityUiState(
-            campuses = listOfNotNull(campus),
-            buildings = listOfNotNull(building),
-            rooms = listOfNotNull(room),
-            equipmentTypes = equipmentTypes,
-            campus = campus,
-            building = building,
-            room = room,
-            equipment = equipment,
-            loading = DormElectricityLoading.CAMPUSES
+            campuses = listOfNotNull(campus), buildings = listOfNotNull(building), rooms = listOfNotNull(room),
+            equipmentTypes = listOfNotNull(equipment), campus = campus, building = building,
+            room = room, equipment = equipment, loading = DormElectricityLoading.CAMPUSES
         )
     }
 
     private fun loadDormCampuses(restoreSelection: Boolean, preferredCampusLabel: String? = null) {
         val page = dormElectricityOverlay ?: return
-        val generation = ++dormElectricityRequestGeneration
+        invalidateDormRequests()
+        val generation = dormElectricityRequestGeneration
         updateDormElectricityState {
-            it.copy(loading = DormElectricityLoading.CAMPUSES, error = null, reading = null)
+            clearDormResult(it).copy(loading = DormElectricityLoading.CAMPUSES)
         }
         networkExecutor.execute {
-            val result = runCatching { dormElectricityRepository.loadCampuses() }
+            val result = runCatching { dormElectricityRepository.loadCampuses(forceRefresh = !restoreSelection) }
             runOnUiThread {
                 if (generation != dormElectricityRequestGeneration || dormElectricityOverlay !== page) return@runOnUiThread
                 result.onSuccess { campuses ->
-                    if (campuses.isEmpty()) {
-                        updateDormElectricityState { it.copy(loading = null, error = "未获取到校区信息") }
-                        return@onSuccess
-                    }
-                    val preferences = dormElectricityPreferences()
-                    val savedCode = if (restoreSelection) preferences.getString("campus_code", null) else null
-                    val campus = campuses.firstOrNull { it.code == savedCode }
+                    val savedLabel = if (restoreSelection) dormElectricityPreferences().getString("campus_label", null) else null
+                    val campus = campuses.firstOrNull { it.label == savedLabel }
                         ?: campuses.firstOrNull { it.label == preferredCampusLabel }
-                        ?: campuses.firstOrNull { it.code == "3" }
-                        ?: campuses.first()
-                    updateDormElectricityState { current ->
-                        val preserveSaved = restoreSelection && current.campus?.code == campus.code
-                        current.copy(
-                            campuses = campuses,
-                            campus = campus,
-                            buildings = if (preserveSaved) current.buildings else emptyList(),
-                            building = if (preserveSaved) current.building else null,
-                            rooms = if (preserveSaved) current.rooms else emptyList(),
-                            room = if (preserveSaved) current.room else null,
-                            loading = DormElectricityLoading.BUILDINGS,
-                            error = null,
-                            reading = null
-                        )
-                    }
+                        ?: campuses.firstOrNull { it.label == "泮河校区中央区" } ?: campuses.first()
+                    updateDormElectricityState { it.copy(campuses = campuses, campus = campus, loading = null) }
                     loadDormBuildings(campus, restoreSelection)
                 }.onFailure { error ->
-                    updateDormElectricityState {
-                        it.copy(loading = null, error = error.message ?: "校区信息加载失败")
-                    }
+                    updateDormElectricityState { it.copy(loading = null, error = error.message ?: "校区信息加载失败") }
                 }
             }
         }
@@ -3769,17 +3743,16 @@ class MainActivity : ComponentActivity() {
 
     private fun loadDormBuildings(campus: DormElectricityOption, restoreSelection: Boolean) {
         val page = dormElectricityOverlay ?: return
-        val generation = ++dormElectricityRequestGeneration
+        invalidateDormRequests()
+        val generation = dormElectricityRequestGeneration
         updateDormElectricityState { current ->
-            val preserveSaved = restoreSelection && current.campus?.code == campus.code
-            current.copy(
-                campus = campus,
-                buildings = if (preserveSaved) current.buildings else emptyList(),
-                rooms = if (preserveSaved) current.rooms else emptyList(),
-                building = if (preserveSaved) current.building else null,
-                room = if (preserveSaved) current.room else null,
-                reading = null,
-                error = null,
+            clearDormResult(current).copy(
+                campus = campus, building = if (restoreSelection) current.building else null,
+                room = if (restoreSelection) current.room else null,
+                buildings = if (restoreSelection) current.buildings else emptyList(),
+                rooms = if (restoreSelection) current.rooms else emptyList(),
+                equipmentTypes = if (restoreSelection) current.equipmentTypes else emptyList(),
+                equipment = if (restoreSelection) current.equipment else null,
                 loading = DormElectricityLoading.BUILDINGS
             )
         }
@@ -3789,19 +3762,19 @@ class MainActivity : ComponentActivity() {
                 if (generation != dormElectricityRequestGeneration || dormElectricityOverlay !== page) return@runOnUiThread
                 result.onSuccess { buildings ->
                     val preferences = dormElectricityPreferences()
-                    val savedCampus = preferences.getString("campus_code", null)
-                    val savedBuilding = if (restoreSelection && savedCampus == campus.code) {
-                        preferences.getString("building_code", null)
-                    } else null
-                    val building = buildings.firstOrNull { it.code == savedBuilding }
+                    val savedBuilding = if (restoreSelection && preferences.getString("campus_label", null) == campus.label)
+                        preferences.getString("building_label", null) else null
+                    val building = buildings.firstOrNull { it.label == savedBuilding }
                     updateDormElectricityState {
-                        it.copy(buildings = buildings, building = building, loading = null)
+                        it.copy(buildings = buildings, building = building, loading = null,
+                            room = if (building != null) it.room else null,
+                            rooms = if (building != null) it.rooms else emptyList(),
+                            equipment = if (building != null) it.equipment else null,
+                            equipmentTypes = if (building != null) it.equipmentTypes else emptyList())
                     }
                     if (building != null) loadDormRooms(building, restoreSelection)
                 }.onFailure { error ->
-                    updateDormElectricityState {
-                        it.copy(loading = null, error = error.message ?: "楼栋信息加载失败")
-                    }
+                    updateDormElectricityState { it.copy(loading = null, error = error.message ?: "楼栋信息加载失败") }
                 }
             }
         }
@@ -3810,174 +3783,286 @@ class MainActivity : ComponentActivity() {
     private fun loadDormRooms(building: DormElectricityOption, restoreSelection: Boolean) {
         val page = dormElectricityOverlay ?: return
         val campus = dormElectricityState.campus ?: return
-        val generation = ++dormElectricityRequestGeneration
-        val equipmentTypes = DormElectricityPolicy.equipmentTypes(campus.code, building.label)
+        invalidateDormRequests()
+        val generation = dormElectricityRequestGeneration
         updateDormElectricityState { current ->
-            val preserveSaved = restoreSelection && current.building?.code == building.code
-            val restoredEquipment = equipmentTypes.firstOrNull {
-                it.code == current.equipment?.code
-            } ?: equipmentTypes.firstOrNull()
-            current.copy(
-                building = building,
-                rooms = if (preserveSaved) current.rooms else emptyList(),
-                room = if (preserveSaved) current.room else null,
-                equipmentTypes = equipmentTypes,
-                equipment = restoredEquipment,
-                reading = null,
-                error = null,
-                loading = DormElectricityLoading.ROOMS
-            )
+            clearDormResult(current).copy(building = building,
+                rooms = if (restoreSelection) current.rooms else emptyList(),
+                room = if (restoreSelection) current.room else null,
+                equipmentTypes = if (restoreSelection) current.equipmentTypes else emptyList(),
+                equipment = if (restoreSelection) current.equipment else null,
+                loading = DormElectricityLoading.ROOMS)
         }
         networkExecutor.execute {
-            val result = runCatching { dormElectricityRepository.loadRooms(building.code) }
+            val result = runCatching { dormElectricityRepository.loadRooms(campus.code, building.code) }
             runOnUiThread {
                 if (generation != dormElectricityRequestGeneration || dormElectricityOverlay !== page) return@runOnUiThread
                 result.onSuccess { rooms ->
                     val preferences = dormElectricityPreferences()
-                    val savedBuilding = preferences.getString("building_code", null)
-                    val savedRoom = if (restoreSelection && savedBuilding == building.code) {
-                        preferences.getString("room_code", null)
-                    } else null
+                    val restore = restoreSelection && preferences.getString("building_label", null) == building.label
+                    val savedRoom = if (restore) preferences.getString("room_code", null) else null
+                    val savedLabel = if (restore) preferences.getString("room_label", null) else null
+                    // Older versions used unrelated numeric IDs. Migrate only an unambiguous visible room name.
                     val room = rooms.firstOrNull { it.code == savedRoom }
-                    val savedEquipment = preferences.getString("equipment_code", null)
-                    val equipment = equipmentTypes.firstOrNull { it.code == savedEquipment }
-                        ?: equipmentTypes.firstOrNull()
+                        ?: rooms.filter { it.label == savedLabel }.singleOrNull()
+                    val types = room?.let { dormElectricityRepository.loadEquipmentTypes(campus.code, building.code, it.code) }.orEmpty()
+                    val equipment = if (preferences.getInt("system_version", 0) == 2)
+                        types.firstOrNull { it.code == preferences.getString("equipment_code", null) } ?: types.singleOrNull()
+                    else types.singleOrNull()
                     updateDormElectricityState {
-                        it.copy(rooms = rooms, room = room, equipment = equipment, loading = null)
+                        it.copy(rooms = rooms, room = room, equipmentTypes = types, equipment = equipment, loading = null)
                     }
                 }.onFailure { error ->
-                    updateDormElectricityState {
-                        it.copy(loading = null, error = error.message ?: "房间信息加载失败")
-                    }
+                    updateDormElectricityState { it.copy(loading = null, error = error.message ?: "房间信息加载失败") }
                 }
             }
         }
     }
 
-    private fun selectDormCampus(campus: DormElectricityOption) {
-        loadDormBuildings(campus, restoreSelection = false)
-    }
-
-    private fun selectDormBuilding(building: DormElectricityOption) {
-        loadDormRooms(building, restoreSelection = false)
-    }
+    private fun selectDormCampus(campus: DormElectricityOption) = loadDormBuildings(campus, false)
+    private fun selectDormBuilding(building: DormElectricityOption) = loadDormRooms(building, false)
 
     private fun selectDormRoom(room: DormElectricityOption) {
-        updateDormElectricityState { it.copy(room = room, reading = null, error = null) }
+        val campus = dormElectricityState.campus ?: return
+        val building = dormElectricityState.building ?: return
+        invalidateDormRequests()
+        val types = dormElectricityRepository.loadEquipmentTypes(campus.code, building.code, room.code)
+        updateDormElectricityState {
+            clearDormResult(it).copy(room = room, equipmentTypes = types, equipment = types.singleOrNull(), loading = null)
+        }
     }
 
     private fun selectDormEquipment(equipment: DormElectricityOption) {
-        updateDormElectricityState { it.copy(equipment = equipment, reading = null, error = null) }
+        invalidateDormRequests()
+        updateDormElectricityState { clearDormResult(it).copy(equipment = equipment, loading = null) }
+    }
+
+    private fun selectedDormMeter(): DormMeter? {
+        val state = dormElectricityState
+        return runCatching {
+            dormElectricityRepository.resolve(state.campus ?: return null, state.building ?: return null,
+                state.room ?: return null, state.equipment ?: return null)
+        }.getOrNull()
+    }
+
+    private fun rememberCurrentDormSelection() {
+        val state = dormElectricityState
+        persistDormSelection(state.campus ?: return, state.building ?: return, state.room ?: return, state.equipment ?: return)
     }
 
     private fun queryDormElectricity() {
         val page = dormElectricityOverlay ?: return
-        val campus = dormElectricityState.campus
-        val building = dormElectricityState.building
-        val room = dormElectricityState.room
-        val equipment = dormElectricityState.equipment
-        if (campus == null || building == null || room == null || equipment == null) {
-            updateDormElectricityState { it.copy(error = "请先选择校区、楼栋、房间和用电类型") }
+        val meter = selectedDormMeter() ?: run {
+            updateDormElectricityState { it.copy(error = "请先选择校区、楼栋、房间和线路") }
             return
         }
-        persistDormSelection(campus, building, room, equipment)
+        rememberCurrentDormSelection()
         val generation = ++dormElectricityRequestGeneration
         updateDormElectricityState { it.copy(loading = DormElectricityLoading.QUERY, error = null) }
         networkExecutor.execute {
-            val result = runCatching {
-                dormElectricityRepository.query(campus, building, room, equipment)
-            }
-            val updatedHistory = result.getOrNull()?.let { reading ->
-                reconcileDormRechargeHistory(campus, building, room, equipment, reading)
-            }
+            val result = runCatching { dormElectricityRepository.query(meter) }
             runOnUiThread {
                 if (generation != dormElectricityRequestGeneration || dormElectricityOverlay !== page) return@runOnUiThread
                 result.onSuccess { reading ->
-                    updateDormElectricityState {
-                        it.copy(
-                            reading = reading,
-                            rechargeHistory = updatedHistory ?: it.rechargeHistory,
-                            loading = null,
-                            error = null
-                        )
-                    }
+                    val lastQuery = dormQueryHistory.record(meter, reading, System.currentTimeMillis())
+                    updateDormElectricityState { it.copy(reading = reading, lastQuery = lastQuery, loading = null, error = null) }
                 }.onFailure { error ->
-                    updateDormElectricityState {
-                        it.copy(reading = null, loading = null, error = error.message ?: "剩余电量查询失败")
+                    updateDormElectricityState { it.copy(reading = null, loading = null, error = error.message ?: "剩余电量查询失败") }
+                }
+            }
+        }
+    }
+
+    private fun loadDormRechargeHistory(reset: Boolean) {
+        val page = dormElectricityOverlay ?: return
+        val meter = selectedDormMeter() ?: run {
+            updateDormElectricityState { it.copy(historyError = "请先选择宿舍和线路", historyLoading = false) }
+            return
+        }
+        if (dormElectricityState.historyLoading || (!reset && !dormElectricityState.historyHasMore)) return
+        val targetPage = if (reset) 1 else dormHistoryPage + 1
+        val generation = ++dormHistoryRequestGeneration
+        updateDormElectricityState { it.copy(historyLoading = true, historyError = null) }
+        networkExecutor.execute {
+            val result = runCatching {
+                dormElectricityRepository.loadHistory(meter, targetPage, paidOnly = true).also { history ->
+                    history.entries.firstOrNull { dormRechargeAnnotations.canCapture(it, meter) }?.let { entry ->
+                        // A missing meter refresh must not prevent reading the school's order history.
+                        runCatching {
+                            dormRechargeAnnotations.recordAfter(entry, meter, dormElectricityRepository.query(meter))
+                        }
                     }
                 }
+            }
+            runOnUiThread {
+                if (generation != dormHistoryRequestGeneration || dormElectricityOverlay !== page || selectedDormMeter() != meter) return@runOnUiThread
+                result.onSuccess { history ->
+                    dormHistoryPage = targetPage
+                    updateDormElectricityState {
+                        it.copy(rechargeHistory = dormRechargeAnnotations.visible(
+                            mergeDormRechargeHistory(it.rechargeHistory, history.entries)),
+                            historyLoading = false, historyError = null, historyHasMore = history.hasMore)
+                    }
+                }.onFailure { error ->
+                    updateDormElectricityState { it.copy(historyLoading = false, historyError = error.message ?: "充值记录加载失败") }
+                }
+            }
+        }
+    }
+
+    private fun deleteDormRechargeHistory(entry: DormRechargeHistoryEntry) {
+        dormRechargeAnnotations.hide(entry.orderId)
+        updateDormElectricityState { it.copy(rechargeHistory = dormRechargeAnnotations.visible(it.rechargeHistory)) }
+    }
+
+    /** Explicit synchronization restores all paid orders; failed attempts retain the list and hidden marks. */
+    private fun syncDormRechargeHistory() {
+        val page = dormElectricityOverlay ?: return
+        val meter = selectedDormMeter() ?: return
+        if (dormElectricityState.historyLoading) return
+        val generation = ++dormHistoryRequestGeneration
+        stopDormHistoryPolling()
+        updateDormElectricityState { it.copy(historyLoading = true, historyError = null) }
+        networkExecutor.execute {
+            val result = runCatching {
+                dormElectricityRepository.syncPaidHistory(meter) { generation != dormHistoryRequestGeneration }
+            }
+            runOnUiThread {
+                if (generation != dormHistoryRequestGeneration || dormElectricityOverlay !== page || selectedDormMeter() != meter) return@runOnUiThread
+                result.onSuccess { records ->
+                    updateDormElectricityState { it.copy(historyLoading = false, historyError = null, historyHasMore = false,
+                        rechargeHistory = dormRechargeAnnotations.restorePaid(records)) }
+                }.onFailure { error ->
+                    updateDormElectricityState { it.copy(historyLoading = false, historyError = error.message ?: "同步失败，请稍后重试") }
+                }
+                scheduleDormHistoryPoll()
+            }
+        }
+    }
+
+    private fun setDormHistoryVisible(visible: Boolean) {
+        dormHistoryVisible = visible
+        stopDormHistoryPolling()
+        if (visible) {
+            dormRechargeVerificationRunnable?.let(window.decorView::removeCallbacks)
+            dormRechargeVerificationRunnable = null
+            scheduleDormHistoryPoll()
+        } else if (dormPageResumed) scheduleDormRechargeVerification()
+    }
+
+    private fun stopDormHistoryPolling() {
+        dormHistoryPollGeneration++
+        dormHistoryPollRunnable?.let(window.decorView::removeCallbacks)
+        dormHistoryPollRunnable = null
+        // An in-flight HTTP request keeps its single-flight flag until its callback completes.
+    }
+
+    private fun scheduleDormHistoryPoll() {
+        dormHistoryPollRunnable?.let(window.decorView::removeCallbacks)
+        dormHistoryPollRunnable = null
+        if (!dormHistoryVisible || !dormPageResumed || dormElectricityOverlay == null) return
+        dormHistoryPollRunnable = Runnable {
+            dormHistoryPollRunnable = null
+            pollDormHistorySilently()
+        }.also { window.decorView.postDelayed(it, 500L) }
+    }
+
+    private fun pollDormHistorySilently() {
+        val page = dormElectricityOverlay ?: return
+        if (!dormHistoryVisible || !dormPageResumed) return
+        val meter = selectedDormMeter() ?: return
+        if (dormHistoryPollRunning || dormElectricityState.historyLoading || dormRechargeVerificationRunning ||
+            dormElectricityState.loading != null) {
+            scheduleDormHistoryPoll()
+            return
+        }
+        val tracked = dormElectricityState.rechargeHistory.filter {
+            !it.credited || (it.beforePaidKwh != null && it.rechargedKwh == null && dormRechargeAnnotations.canCapture(it, meter))
+        }.map { it.orderId } + listOfNotNull(pendingDormPayment?.takeIf {
+            it.meter == meter && dormElectricityState.rechargeQr == null
+        }?.payment?.orderId?.takeIf { it.isNotBlank() })
+        val pollTargets = dormHistoryPollTargets
+        val pendingOrderId = pendingDormPayment?.takeIf { it.meter == meter && dormElectricityState.rechargeQr == null }?.payment?.orderId
+        val generation = dormHistoryPollGeneration
+        val historyGeneration = dormHistoryRequestGeneration
+        dormHistoryPollRunning = true
+        networkExecutor.execute {
+            val result = runCatching {
+                check(generation == dormHistoryPollGeneration)
+                val latest = dormElectricityRepository.loadHistory(meter, paidOnly = true).entries
+                check(generation == dormHistoryPollGeneration)
+                // Every tick refreshes the latest page; only older unfinished orders need an extra request.
+                val latestIds = latest.mapTo(hashSetOf()) { it.orderId }
+                val olderId = pollTargets.next(tracked.distinct().filterNot { it in latestIds })
+                val entries = if (olderId == null) latest else mergeDormRechargeHistory(latest,
+                    dormElectricityRepository.loadHistory(meter, orderId = olderId, paidOnly = true).entries)
+                check(generation == dormHistoryPollGeneration)
+                val credited = entries.firstOrNull {
+                    it.credited && it.line == meter.line &&
+                        (it.orderId == pendingOrderId || dormRechargeAnnotations.canCapture(it, meter))
+                }
+                val reading = credited?.let { entry ->
+                    runCatching { dormElectricityRepository.query(meter).also {
+                        dormRechargeAnnotations.recordAfter(entry, meter, it)
+                    } }.getOrNull()
+                }
+                entries to reading
+            }
+            runOnUiThread {
+                dormHistoryPollRunning = false
+                if (generation == dormHistoryPollGeneration && historyGeneration == dormHistoryRequestGeneration &&
+                    dormElectricityOverlay === page && selectedDormMeter() == meter && dormPageResumed && dormHistoryVisible) {
+                    result.onSuccess { (entries, reading) ->
+                        updateDormElectricityState { it.copy(
+                            rechargeHistory = dormRechargeAnnotations.visible(mergeDormRechargeHistory(it.rechargeHistory, entries)),
+                            reading = reading ?: it.reading) }
+                        pendingDormPayment?.let { pending ->
+                            if (entries.any { it.orderId == pending.payment.orderId && it.credited &&
+                                !dormRechargeAnnotations.canCapture(it, meter) }) pendingDormPayment = null
+                        }
+                    }
+                    // Poll failures are silent: retain the last successful state, with no toast/spinner.
+                }
+                scheduleDormHistoryPoll()
             }
         }
     }
 
     private fun rechargeDormElectricity(amount: Double) {
         val page = dormElectricityOverlay ?: return
-        val campus = dormElectricityState.campus ?: return
-        val building = dormElectricityState.building ?: return
-        val room = dormElectricityState.room ?: return
-        val equipment = dormElectricityState.equipment ?: return
-        val beforeKwh = dormElectricityState.reading?.remainingKwh
-        dormRechargeVerificationGeneration++
-        dormRechargeVerificationRunnable?.let(window.decorView::removeCallbacks)
-        dormRechargeVerificationRunnable = null
-        pendingDormRechargeHistoryEntry = null
+        if (dormElectricityState.loading != null) return
+        val meter = selectedDormMeter() ?: return
+        val lineLabel = dormElectricityState.equipment?.label ?: return
+        rememberCurrentDormSelection()
+        cancelDormRechargeQr()
         val generation = ++dormElectricityRequestGeneration
-        updateDormElectricityState {
-            it.copy(
-                loading = DormElectricityLoading.RECHARGE,
-                rechargeQr = null,
-                rechargeError = null
-            )
-        }
+        updateDormElectricityState { it.copy(loading = DormElectricityLoading.RECHARGE, rechargeQr = null, rechargeError = null) }
         networkExecutor.execute {
             val result = runCatching {
-                dormElectricityRepository.createRechargePayment(campus, building, room, equipment, amount)
+                // Fresh paid balance immediately before creating this order, not the cached total balance.
+                val before = dormElectricityRepository.query(meter)
+                val capturedAt = System.currentTimeMillis()
+                Triple(dormElectricityRepository.createRechargePayment(meter, lineLabel, amount), before, capturedAt)
             }
             runOnUiThread {
                 if (generation != dormElectricityRequestGeneration || dormElectricityOverlay !== page) return@runOnUiThread
-                result.onSuccess { payment ->
+                result.onSuccess { (payment, before, capturedAt) ->
+                    pendingDormPayment = DormPendingPayment(payment, meter)
                     dormPaymentQrResolver.resolve(payment) resolve@{ qrResult ->
-                        if (generation != dormElectricityRequestGeneration || dormElectricityOverlay !== page) {
-                            return@resolve
-                        }
+                        if (generation != dormElectricityRequestGeneration || dormElectricityOverlay !== page) return@resolve
                         qrResult.onSuccess { qr ->
-                            val entry = DormRechargeHistoryEntry(
-                                location = "${campus.label}-${building.label}-${room.label}-${equipment.label}",
-                                campusCode = campus.code,
-                                buildingCode = building.code,
-                                roomCode = room.code,
-                                equipmentCode = equipment.code,
-                                amount = amount,
-                                createdAt = System.currentTimeMillis(),
-                                beforeKwh = beforeKwh
-                            )
-                            pendingDormRechargeHistoryEntry = entry
-                            updateDormElectricityState {
-                                it.copy(
-                                    loading = null,
-                                    rechargeQr = qr,
-                                    rechargeError = null
-                                )
-                            }
+                            dormRechargeAnnotations.rememberBefore(qr.orderId, meter, before, capturedAt)
+                            pendingDormPayment = DormPendingPayment(payment.copy(orderId = qr.orderId), meter)
+                            updateDormElectricityState { it.copy(loading = null, rechargeQr = qr, rechargeError = null) }
                         }.onFailure { error ->
-                            pendingDormRechargeHistoryEntry = null
-                            updateDormElectricityState {
-                                it.copy(
-                                    loading = null,
-                                    rechargeQr = null,
-                                    rechargeError = error.message ?: "充值二维码生成失败"
-                                )
-                            }
+                            pendingDormPayment = null
+                            updateDormElectricityState { it.copy(loading = null, rechargeQr = null, rechargeError = error.message ?: "充值二维码生成失败") }
                         }
                     }
                 }.onFailure { error ->
-                    pendingDormRechargeHistoryEntry = null
                     updateDormElectricityState {
-                        it.copy(
-                            loading = null,
-                            rechargeQr = null,
-                            rechargeError = error.message ?: "充值二维码生成失败"
-                        )
+                        it.copy(loading = null, rechargeQr = null,
+                            rechargeError = "未能获取充值订单：${error.message ?: "连接失败"}。请先在充值记录中核对，避免重复下单。")
                     }
                 }
             }
@@ -3985,98 +4070,68 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun cancelDormRechargeQr() {
-        pendingDormRechargeHistoryEntry = null
-        updateDormElectricityState {
-            it.copy(loading = null, rechargeQr = null, rechargeError = null)
-        }
+        dormElectricityRequestGeneration++
+        dormRechargeVerificationGeneration++
+        dormRechargeVerificationRunnable?.let(window.decorView::removeCallbacks)
+        dormRechargeVerificationRunnable = null
+        dormRechargeVerificationRunning = false
+        pendingDormPayment = null
+        dormPaymentQrResolver.cancel()
+        updateDormElectricityState { it.copy(loading = null, rechargeQr = null, rechargeError = null) }
     }
 
     private fun completeDormRechargeQr() {
-        val page = dormElectricityOverlay ?: return
-        val entry = pendingDormRechargeHistoryEntry
-        pendingDormRechargeHistoryEntry = null
-        updateDormElectricityState {
-            it.copy(loading = null, rechargeQr = null, rechargeError = null)
-        }
-        if (entry == null) return
-        networkExecutor.execute {
-            val updatedHistory = (listOf(entry) + dormRechargeHistoryStore.load())
-                .distinctBy { it.id }
-            dormRechargeHistoryStore.save(updatedHistory)
-            runOnUiThread {
-                if (dormElectricityOverlay !== page) return@runOnUiThread
-                updateDormElectricityState { it.copy(rechargeHistory = updatedHistory) }
-                scheduleDormRechargeVerification(delayMillis = 1_200L)
-            }
-        }
+        updateDormElectricityState { it.copy(loading = null, rechargeQr = null, rechargeError = null) }
+        loadDormRechargeHistory(reset = true)
+        scheduleDormRechargeVerification(delayMillis = 1_200L)
     }
 
-    /**
-     * The school payment page has no reliable app callback. Treat the recharge as paid only
-     * after the queried balance has actually increased; failed/unfinished payments therefore
-     * leave both the visible balance and the history entry untouched.
-     */
-    private fun scheduleDormRechargeVerification(
-        delayMillis: Long = 0L,
-        attemptsRemaining: Int = 60
-    ) {
-        if (attemptsRemaining <= 0 || dormElectricityOverlay == null) return
-        val decor = window.decorView
-        dormRechargeVerificationRunnable?.let(decor::removeCallbacks)
+    /** Confirm this exact server order; a tap on 完成 or a balance increase is not proof of payment. */
+    private fun scheduleDormRechargeVerification(delayMillis: Long = 0L, attemptsRemaining: Int = 30) {
+        if (!dormPageResumed || dormHistoryVisible || attemptsRemaining <= 0 || dormElectricityOverlay == null || pendingDormPayment == null) return
+        dormRechargeVerificationRunnable?.let(window.decorView::removeCallbacks)
         val generation = dormRechargeVerificationGeneration
         val task = Runnable {
             dormRechargeVerificationRunnable = null
-            if (generation == dormRechargeVerificationGeneration) {
-                verifyPendingDormRecharge(attemptsRemaining)
-            }
+            if (generation == dormRechargeVerificationGeneration) verifyPendingDormRecharge(attemptsRemaining)
         }
         dormRechargeVerificationRunnable = task
-        decor.postDelayed(task, delayMillis)
+        window.decorView.postDelayed(task, delayMillis)
     }
 
     private fun verifyPendingDormRecharge(attemptsRemaining: Int) {
+        if (!dormPageResumed || dormHistoryVisible) return
         val page = dormElectricityOverlay ?: return
-        if (dormRechargeVerificationRunning) {
-            scheduleDormRechargeVerification(delayMillis = 1_000L, attemptsRemaining = attemptsRemaining)
+        val pending = pendingDormPayment ?: return
+        if (pending.payment.orderId.isBlank() || selectedDormMeter() != pending.meter) return
+        if (dormRechargeVerificationRunning || dormHistoryPollRunning || dormElectricityState.historyLoading) {
+            scheduleDormRechargeVerification(1_000L, attemptsRemaining)
             return
         }
-        val campus = dormElectricityState.campus ?: return
-        val building = dormElectricityState.building ?: return
-        val room = dormElectricityState.room ?: return
-        val equipment = dormElectricityState.equipment ?: return
-        val pending = dormRechargeHistoryStore.load().firstOrNull { entry ->
-            entry.afterKwh == null && entry.beforeKwh != null &&
-                entry.campusCode == campus.code && entry.buildingCode == building.code &&
-                entry.roomCode == room.code && entry.equipmentCode == equipment.code
-        } ?: return
         val generation = dormRechargeVerificationGeneration
         dormRechargeVerificationRunning = true
         networkExecutor.execute {
             val result = runCatching {
-                dormElectricityRepository.query(campus, building, room, equipment)
+                val entry = dormElectricityRepository.loadHistory(pending.meter, orderId = pending.payment.orderId)
+                    .entries.firstOrNull { it.orderId == pending.payment.orderId && it.line == pending.meter.line }
+                val reading = if (entry?.credited == true) dormElectricityRepository.query(pending.meter) else null
+                if (entry != null && reading != null) dormRechargeAnnotations.recordAfter(entry, pending.meter, reading)
+                entry to reading
             }
             runOnUiThread {
+                if (generation != dormRechargeVerificationGeneration || dormElectricityOverlay !== page || pendingDormPayment != pending) return@runOnUiThread
                 dormRechargeVerificationRunning = false
-                if (generation != dormRechargeVerificationGeneration || dormElectricityOverlay !== page) {
-                    return@runOnUiThread
-                }
-                val reading = result.getOrNull()
-                if (reading != null) {
-                    val history = reconcileDormRechargeHistory(campus, building, room, equipment, reading)
-                    val confirmed = history.firstOrNull { it.id == pending.id }?.addedKwh != null
-                    if (confirmed) {
-                        updateDormElectricityState {
-                            it.copy(reading = reading, rechargeHistory = history, error = null)
-                        }
-                        return@runOnUiThread
+                val (entry, reading) = result.getOrNull() ?: (null to null)
+                if (entry != null) {
+                    updateDormElectricityState { state ->
+                        state.copy(rechargeHistory = dormRechargeAnnotations.visible(
+                            (state.rechargeHistory.filterNot { it.orderId == entry.orderId } + entry)
+                                .sortedByDescending { it.createdAt }),
+                            reading = reading ?: state.reading)
                     }
                 }
-                if (attemptsRemaining > 1) {
-                    scheduleDormRechargeVerification(
-                        delayMillis = 10_000L,
-                        attemptsRemaining = attemptsRemaining - 1
-                    )
-                }
+                if (reading != null && entry != null && !dormRechargeAnnotations.canCapture(entry, pending.meter)) pendingDormPayment = null
+                else if (attemptsRemaining > 1) scheduleDormRechargeVerification(10_000L, attemptsRemaining - 1)
             }
         }
     }
@@ -4099,7 +4154,7 @@ class MainActivity : ComponentActivity() {
             runOnUiThread {
                 result.onSuccess {
                     showLiquidToast(
-                        message = "支付码已保存到相册，请到建行APP中扫码充值",
+                        message = "支付码已保存到相册",
                         visual = LiquidToastVisual.SUCCESS,
                         durationMillis = 3_200L
                     )
@@ -4163,6 +4218,7 @@ class MainActivity : ComponentActivity() {
         equipment: DormElectricityOption
     ) {
         dormElectricityPreferences().edit()
+            .putInt("system_version", 2)
             .putString("campus_code", campus.code)
             .putString("campus_label", campus.label)
             .putString("building_code", building.code)
@@ -4195,29 +4251,6 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    private fun reconcileDormRechargeHistory(
-        campus: DormElectricityOption,
-        building: DormElectricityOption,
-        room: DormElectricityOption,
-        equipment: DormElectricityOption,
-        reading: DormElectricityReading
-    ): List<DormRechargeHistoryEntry> {
-        val entries = dormRechargeHistoryStore.load().toMutableList()
-        val index = entries.indexOfFirst { entry ->
-            entry.afterKwh == null && entry.beforeKwh != null &&
-                entry.campusCode == campus.code && entry.buildingCode == building.code &&
-                entry.roomCode == room.code && entry.equipmentCode == equipment.code
-        }
-        if (index >= 0) {
-            val entry = entries[index]
-            val delta = reading.remainingKwh - (entry.beforeKwh ?: reading.remainingKwh)
-            if (delta > 0.001) {
-                entries[index] = entry.copy(afterKwh = reading.remainingKwh, addedKwh = delta)
-                dormRechargeHistoryStore.save(entries)
-            }
-        }
-        return entries.sortedByDescending { it.createdAt }
-    }
 
     private fun refreshPersonalSchedule() {
         if (scheduleRefreshRunning || viewingPublicSchedule) return
@@ -7646,6 +7679,8 @@ class MainActivity : ComponentActivity() {
             return
         }
         if (dormElectricityOverlay != null) {
+            // Legacy Activity back handling must obey the detail dialog's close-button-only rule too.
+            if (dormElectricityOverlay?.isRechargeDetailVisible() == true) return
             hideDormElectricityPage()
             return
         }
@@ -10137,8 +10172,18 @@ class MainActivity : ComponentActivity() {
         super.onStop()
     }
 
+    override fun onPause() {
+        dormPageResumed = false
+        stopDormHistoryPolling()
+        dormRechargeVerificationRunnable?.let(window.decorView::removeCallbacks)
+        dormRechargeVerificationRunnable = null
+        super.onPause()
+    }
+
     override fun onResume() {
         super.onResume()
+        dormPageResumed = true
+        scheduleDormHistoryPoll()
         refreshScheduleCalendar()
         hideSystemNavigationBar()
         if (dormElectricityOverlay != null) {
@@ -10239,7 +10284,7 @@ class MainActivity : ComponentActivity() {
         refreshScheduleConfirmOverlay?.releaseSnapshot()
         refreshScheduleConfirmOverlay = null
         dormElectricityOverlay = null
-        dormElectricityRequestGeneration++
+        invalidateDormRequests()
         dormPaymentQrResolver.dispose()
         (shareOverlay as? LiquidPickerDialogView)?.releaseSnapshot()
         actionMenuOverlay?.releaseSnapshot()

@@ -11,6 +11,7 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.unit.Dp
@@ -22,9 +23,9 @@ internal fun CampusLoadingSpinner(
     label: String,
     rotationLabel: String,
     size: Dp = 38.dp,
-    strokeWidth: Dp = 4.dp
+    strokeWidth: Dp = 4.dp,
+    color: Color = CampusComposeTheme.colors.accent
 ) {
-    val accent = CampusComposeTheme.colors.accent
     val transition = rememberInfiniteTransition(label = label)
     val rotation by transition.animateFloat(
         initialValue = 0f,
@@ -33,8 +34,8 @@ internal fun CampusLoadingSpinner(
         label = rotationLabel
     )
     Canvas(Modifier.size(size)) {
-        drawArc(accent.copy(alpha = 0.22f), 0f, 360f, false, style = Stroke(strokeWidth.toPx(), cap = StrokeCap.Round))
-        drawArc(accent, rotation, 102f, false, style = Stroke(strokeWidth.toPx(), cap = StrokeCap.Round))
+        drawArc(color.copy(alpha = 0.22f), 0f, 360f, false, style = Stroke(strokeWidth.toPx(), cap = StrokeCap.Round))
+        drawArc(color, rotation, 102f, false, style = Stroke(strokeWidth.toPx(), cap = StrokeCap.Round))
     }
 }
 
