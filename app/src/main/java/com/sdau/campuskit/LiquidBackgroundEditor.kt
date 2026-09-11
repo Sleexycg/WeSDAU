@@ -6,7 +6,6 @@ import android.os.SystemClock
 import android.widget.FrameLayout
 import androidx.compose.animation.core.Animatable
 import androidx.compose.animation.core.spring
-import androidx.compose.animation.core.tween
 import androidx.compose.foundation.MutatorMutex
 import androidx.compose.foundation.background
 import androidx.compose.foundation.gestures.awaitEachGesture
@@ -278,7 +277,7 @@ internal class LiquidBackgroundEditorView(
         dismissing = true
         panelVisibleState.value = false
         applyToastState.value = WallpaperApplyToastState.HIDDEN
-        postDelayed(onFinished, 210L)
+        postDelayed(onFinished, FloatingBottomPanelMetrics.RemovalDelayMillis)
     }
 
     fun beginApplySequence(onControlsHidden: () -> Unit) {
@@ -412,24 +411,7 @@ private fun BackgroundEditorScreen(
             themeColors.isDark
         )
     }
-    val panelReveal = remember { Animatable(1f) }
-    LaunchedEffect(panelVisible) {
-        if (panelVisible) {
-            panelReveal.animateTo(
-                targetValue = 0f,
-                animationSpec = spring(
-                    dampingRatio = 0.82f,
-                    stiffness = 360f,
-                    visibilityThreshold = 0.001f
-                )
-            )
-        } else {
-            panelReveal.animateTo(
-                targetValue = 1f,
-                animationSpec = tween(durationMillis = 180)
-            )
-        }
-    }
+    val panelReveal = rememberFloatingBottomPanelMotion(panelVisible)
     LaunchedEffect(previewCrop, clarity, cropSize) {
         if (cropSize.width > 0 && cropSize.height > 0) onPreview(previewCrop, clarity)
     }
@@ -500,15 +482,13 @@ private fun BackgroundEditorScreen(
         Column(
             Modifier
                 .align(Alignment.BottomCenter)
-                .padding(start = 6.dp, end = 6.dp, bottom = 12.dp)
+                .padding(horizontal = FloatingBottomPanelMetrics.SideInsetDp.dp)
+                .padding(bottom = FloatingBottomPanelMetrics.BottomInsetDp.dp)
                 .fillMaxWidth()
-                .graphicsLayer {
-                    translationY = panelReveal.value * (size.height + 28.dp.toPx())
-                    alpha = 1f - panelReveal.value * 0.25f
-                }
+                .floatingBottomPanelMotion(panelReveal)
                 .drawBackdrop(
                     backdrop = backgroundBackdrop,
-                    shape = { RoundedRectangle(30.dp) },
+                    shape = { RoundedRectangle(FloatingBottomPanelMetrics.RadiusDp.dp) },
                     effects = {
                         blur((if (themeColors.isDark) 8.dp else 18.dp).toPx())
                         lens(4.dp.toPx(), 8.dp.toPx())
@@ -518,8 +498,11 @@ private fun BackgroundEditorScreen(
                     },
                     onDrawSurface = { drawRect(themeColors.glassSurface) }
                 )
-                .padding(start = 22.dp, top = 22.dp, end = 22.dp, bottom = 34.dp),
-            verticalArrangement = Arrangement.spacedBy(16.dp)
+                .padding(start = FloatingBottomPanelMetrics.ContentSideDp.dp,
+                    top = FloatingBottomPanelMetrics.ContentTopDp.dp,
+                    end = FloatingBottomPanelMetrics.ContentSideDp.dp,
+                    bottom = FloatingBottomPanelMetrics.ContentBottomDp.dp),
+            verticalArrangement = Arrangement.spacedBy(FloatingBottomPanelMetrics.ContentGapDp.dp)
         ) {
             Row(
                 Modifier.fillMaxWidth(),
@@ -528,11 +511,11 @@ private fun BackgroundEditorScreen(
             ) {
                 BasicText(
                     "背景清晰度",
-                    style = TextStyle(themeColors.primaryText, 19.sp, FontWeight.SemiBold)
+                    style = BackgroundControlsTitleStyle.copy(color = themeColors.primaryText)
                 )
                 BasicText(
                     "${(clarity * 100).roundToInt()}%",
-                    style = TextStyle(themeColors.accent, 18.sp, FontWeight.Bold)
+                    style = BackgroundControlsValueStyle.copy(color = themeColors.accent)
                 )
             }
             ReferenceLiquidSlider(
@@ -555,7 +538,7 @@ private fun BackgroundEditorScreen(
                     enabled = !submitted,
                     allowDragDeformation = false,
                     modifier = Modifier.weight(1f),
-                    height = 60.dp
+                    height = FloatingBottomPanelMetrics.ActionHeightDp.dp
                 ) {
                     BasicText(
                         "取消",
@@ -569,7 +552,7 @@ private fun BackgroundEditorScreen(
                     enabled = !submitted,
                     allowDragDeformation = false,
                     modifier = Modifier.weight(1f),
-                    height = 60.dp
+                    height = FloatingBottomPanelMetrics.ActionHeightDp.dp
                 ) {
                     BasicText("应用", style = TextStyle(Color.White, 18.sp, FontWeight.SemiBold))
                 }
@@ -726,7 +709,7 @@ private fun ReferenceLiquidSlider(
                         drawRect(Color.White.copy(alpha = 1f - dragAnimation.pressProgress))
                     }
                 )
-                .size(40.dp, 24.dp)
+                .size(40.dp, FloatingBottomPanelMetrics.SliderHeightDp.dp)
         )
     }
 }

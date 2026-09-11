@@ -8649,19 +8649,6 @@ class MainActivity : ComponentActivity() {
             gestureAxis == 0 && pageAnimator == null && courseRemovalAnimator == null &&
             courseLongPressCandidate?.let { sameCourseRecord(it, course) } == true
 
-        fun courseDeleteZoneHeightFraction(): Float {
-            if (pageHost.height <= 0 || slotHeight <= 0) return .22f
-            val gridLocation = IntArray(2)
-            val hostLocation = IntArray(2)
-            getLocationInWindow(gridLocation)
-            pageHost.getLocationInWindow(hostLocation)
-            // Align to the start of period 9, not through its number or time lines.
-            // Use actual grid coordinates to account for scrolling and screen size.
-            val eveningTop = gridLocation[1] - hostLocation[1] + headerHeight + 8 * slotHeight
-            val topFraction = minOf(.78f, eveningTop.toFloat() / pageHost.height).coerceAtLeast(.5f)
-            return 1f - topFraction
-        }
-
         fun showCourseDeleteTarget(owner: LiquidCourseDeleteTargetView) {
             deleteTargetOwner = owner
             clearSwipeBitmaps()
@@ -9829,7 +9816,6 @@ class MainActivity : ComponentActivity() {
             }
             lateinit var overlay: LiquidCourseDeleteTargetView
             overlay = LiquidCourseDeleteTargetView(this, snapshot, preview,
-                zoneHeightFraction = grid.courseDeleteZoneHeightFraction(),
                 onDelete = {
                     val valid = courseDragDeleteOverlay === overlay && !viewingPublicSchedule && !onLoginPage &&
                         currentMainSection == 0 && scheduleGrid === grid && isActiveAcademicSession(account, term) &&

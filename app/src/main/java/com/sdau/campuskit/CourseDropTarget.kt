@@ -2,14 +2,16 @@ package com.sdau.campuskit
 
 import kotlin.math.roundToInt
 
-/** One pixel-space layout for equal left/right/bottom insets and all four corners. */
+/** Same dimensions as the wallpaper controls, independent of screen/semester height. */
 internal object CourseDeleteCardLayout {
-    fun bounds(width: Float, height: Float, density: Float, heightFraction: Float): CourseDropTarget {
-        if (width <= 0f || height <= 0f) return CourseDropTarget(0f, 0f, 0f, 0f, 0f)
-        val inset = (12f * density).roundToInt().toFloat().coerceIn(0f, minOf(width, height) / 2f)
-        val top = (height * (1f - heightFraction.coerceIn(0f, 1f))).roundToInt().toFloat()
-            .coerceIn(0f, height - inset)
-        return CourseDropTarget(inset, top, width - inset, height - inset, 24f * density)
+    fun bounds(width: Float, height: Float, density: Float, cardHeightPx: Float): CourseDropTarget {
+        if (!width.isFinite() || !height.isFinite() || !density.isFinite() || !cardHeightPx.isFinite() ||
+            width <= 0f || height <= 0f || density <= 0f || cardHeightPx <= 0f
+        ) return CourseDropTarget(0f, 0f, 0f, 0f, 0f)
+        val side = (FloatingBottomPanelMetrics.SideInsetDp * density).roundToInt().toFloat().coerceAtMost(width / 2f)
+        val bottom = height - (FloatingBottomPanelMetrics.BottomInsetDp * density).roundToInt().toFloat().coerceAtMost(height)
+        val top = (bottom - cardHeightPx.roundToInt()).coerceAtLeast(0f)
+        return CourseDropTarget(side, top, width - side, bottom, FloatingBottomPanelMetrics.RadiusDp * density)
     }
 }
 
