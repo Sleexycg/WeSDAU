@@ -9,6 +9,7 @@ import androidx.compose.animation.core.tween
 import androidx.compose.animation.animateContentSize
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -25,6 +26,7 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.text.BasicText
+import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -36,8 +38,9 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.Shadow
+import androidx.compose.ui.graphics.SolidColor
+import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.platform.ComposeView
@@ -256,14 +259,20 @@ private fun EmptyRoomLiquidGroupCard(
     }
     val pageGradient = Brush.linearGradient(themeColors.pageGradient)
     val textPrimary = Color(textPalette.primary)
+    val textSecondary = Color(textPalette.secondary)
     val textShadow = scheduleTextShadow(textPalette)
     var expanded by remember(groupKey) { mutableStateOf(initiallyExpanded) }
+    var searchText by remember(groupKey) { mutableStateOf("") }
     val chevronRotation by animateFloatAsState(
         targetValue = if (expanded) 180f else 0f,
         animationSpec = tween(durationMillis = 220),
         label = "emptyRoomGroupChevronRotation"
     )
-    val roomRows = remember(rooms) { rooms.chunked(2) }
+    val filteredRooms = remember(rooms, searchText) {
+        val query = searchText.trim()
+        if (query.isBlank()) rooms else rooms.filter { it.contains(query, ignoreCase = true) }
+    }
+    val roomRows = remember(filteredRooms) { filteredRooms.chunked(2) }
 
     val cardShape = RoundedRectangle(20.dp)
     Box(
@@ -309,39 +318,67 @@ private fun EmptyRoomLiquidGroupCard(
                 )
                 .padding(horizontal = 15.dp, vertical = 18.dp)
         ) {
+            val toggleExpanded: () -> Unit = {
+                expanded = !expanded
+                // 折叠时清空搜索并隐藏搜索框，重新展开不会残留筛选。
+                if (!expanded) searchText = ""
+                onExpandedChanged(expanded)
+            }
             Row(
-                Modifier
-                    .fillMaxWidth()
-                    .clickable(
-                        interactionSource = null,
-                        indication = null,
-                        role = Role.Button
-                    ) {
-                        expanded = !expanded
-                        onExpandedChanged(expanded)
-                    },
+                Modifier.fillMaxWidth(),
                 verticalAlignment = Alignment.CenterVertically
             ) {
-                Box(
+                Row(
                     Modifier
-                        .padding(end = 10.dp)
-                        .size(width = 5.dp, height = 23.dp)
-                        .clip(RoundedRectangle(3.dp))
-                        .background(Color(accentColor))
-                )
-                BasicText(
-                    title,
-                    modifier = Modifier.weight(1f),
-                    style = TextStyle(
-                        color = textPrimary,
-                        fontSize = 16.sp,
-                        fontWeight = FontWeight.Bold,
-                        shadow = textShadow
+                        .weight(1f)
+                        .clickable(
+                            interactionSource = null,
+                            indication = null,
+                            role = Role.Button,
+                            onClick = toggleExpanded
+                        ),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Box(
+                        Modifier
+                            .padding(end = 10.dp)
+                            .size(width = 5.dp, height = 23.dp)
+                            .clip(RoundedRectangle(3.dp))
+                            .background(Color(accentColor))
                     )
-                )
+                    BasicText(
+                        title,
+                        modifier = Modifier.weight(1f),
+                        style = TextStyle(
+                            color = textPrimary,
+                            fontSize = 16.sp,
+                            fontWeight = FontWeight.Bold,
+                            shadow = textShadow
+                        )
+                    )
+                }
+                // 搜索框只在展开时显示，和分组标题同一行。
+                if (expanded) {
+                    EmptyRoomGroupSearchField(
+                        value = searchText,
+                        onValueChange = { searchText = it },
+                        textColor = textPrimary,
+                        placeholderColor = textSecondary,
+                        textShadow = textShadow,
+                        modifier = Modifier
+                            .width(116.dp)
+                            .padding(end = 8.dp)
+                    )
+                }
                 Canvas(
                     Modifier
                         .size(width = 32.dp, height = 24.dp)
+                        .clickable(
+                            interactionSource = null,
+                            indication = null,
+                            role = Role.Button,
+                            onClick = toggleExpanded
+                        )
                         .graphicsLayer { rotationZ = chevronRotation }
                 ) {
                     val color = Color(accentColor)
@@ -373,43 +410,98 @@ private fun EmptyRoomLiquidGroupCard(
                 } else {
                     Modifier.padding(top = 12.dp)
                 }
-                Column(
-                    roomContentModifier,
-                    verticalArrangement = Arrangement.spacedBy(4.dp)
-                ) {
-                    roomRows.forEach { pair ->
-                        Row(
-                            Modifier
-                                .fillMaxWidth()
-                                .height(44.dp),
-                            horizontalArrangement = Arrangement.spacedBy(8.dp)
-                        ) {
-                            pair.forEach { room ->
-                                Box(
-                                    Modifier
-                                        .weight(1f)
-                                        .fillMaxSize()
-                                        .padding(horizontal = 10.dp, vertical = 6.dp),
-                                    contentAlignment = Alignment.CenterStart
-                                ) {
-                                    BasicText(
-                                        room,
-                                        style = TextStyle(
-                                            color = textPrimary,
-                                            fontSize = 14.sp,
-                                            fontWeight = FontWeight.Bold,
-                                            shadow = textShadow
+                if (filteredRooms.isEmpty()) {
+                    BasicText(
+                        "未找到匹配教室",
+                        modifier = Modifier.padding(top = 12.dp),
+                        style = TextStyle(
+                            color = textSecondary,
+                            fontSize = 14.sp,
+                            fontWeight = FontWeight.Medium,
+                            shadow = textShadow
+                        )
+                    )
+                } else {
+                    Column(
+                        roomContentModifier,
+                        verticalArrangement = Arrangement.spacedBy(4.dp)
+                    ) {
+                        roomRows.forEach { pair ->
+                            Row(
+                                Modifier
+                                    .fillMaxWidth()
+                                    .height(44.dp),
+                                horizontalArrangement = Arrangement.spacedBy(8.dp)
+                            ) {
+                                pair.forEach { room ->
+                                    Box(
+                                        Modifier
+                                            .weight(1f)
+                                            .fillMaxSize()
+                                            .padding(horizontal = 10.dp, vertical = 6.dp),
+                                        contentAlignment = Alignment.CenterStart
+                                    ) {
+                                        BasicText(
+                                            room,
+                                            style = TextStyle(
+                                                color = textPrimary,
+                                                fontSize = 14.sp,
+                                                fontWeight = FontWeight.Bold,
+                                                shadow = textShadow
+                                            )
                                         )
-                                    )
+                                    }
                                 }
+                                if (pair.size == 1) Box(Modifier.weight(1f))
                             }
-                            if (pair.size == 1) Box(Modifier.weight(1f))
                         }
                     }
                 }
             }
         }
     }
+}
+
+@Composable
+private fun EmptyRoomGroupSearchField(
+    value: String,
+    onValueChange: (String) -> Unit,
+    textColor: Color,
+    placeholderColor: Color,
+    textShadow: Shadow?,
+    modifier: Modifier = Modifier
+) {
+    val themeColors = CampusComposeTheme.colors
+    val shape = RoundedRectangle(19.dp)
+    BasicTextField(
+        value = value,
+        onValueChange = onValueChange,
+        textStyle = TextStyle(textColor, 14.sp, FontWeight.Bold, shadow = textShadow),
+        singleLine = true,
+        cursorBrush = SolidColor(themeColors.accent),
+        modifier = modifier
+            .height(38.dp)
+            .clip(shape)
+            .background(themeColors.glassSurface.copy(alpha = 0.68f), shape)
+            .border(1.dp, themeColors.glassOutline, shape)
+            .padding(horizontal = 12.dp),
+        decorationBox = { inner ->
+            Box(Modifier.fillMaxSize(), contentAlignment = Alignment.CenterStart) {
+                if (value.isBlank()) {
+                    BasicText(
+                        "搜索教室",
+                        style = TextStyle(
+                            placeholderColor.copy(alpha = 0.72f),
+                            13.sp,
+                            FontWeight.Medium,
+                            shadow = textShadow
+                        )
+                    )
+                }
+                inner()
+            }
+        }
+    )
 }
 
 @Composable

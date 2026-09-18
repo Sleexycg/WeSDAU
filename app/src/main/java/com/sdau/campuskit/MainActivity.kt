@@ -1417,7 +1417,15 @@ class MainActivity : ComponentActivity() {
                         .apply()
                     savePasswordCache(id, pwd)
                     saveStudentNameCache(id, profile?.name.orEmpty())
-                    saveCourseCache(courses)
+                    // 同一账号/学期重新登录时保留本地备注；仅读取账号自己的缓存，避免串号。
+                    val accountCacheKey = courseCacheKey(id, selectedSemester)
+                    val existingCourses =
+                        if (getSharedPreferences(PREFS_NAME, MODE_PRIVATE).contains(accountCacheKey)) {
+                            loadCoursesFromPreference(accountCacheKey, false)
+                        } else {
+                            emptyList()
+                        }
+                    saveCourseCache(preserveCourseNotes(existingCourses, courses))
                     loginButton?.setButtonEnabled(true)
                     loginButton?.text = "进入课程表"
                     showSchedulePage()
@@ -2533,8 +2541,11 @@ class MainActivity : ComponentActivity() {
             .setInterpolator(PathInterpolator(.2f, .78f, .2f, 1f))
             .start()
 
-        val layoutParams = controls.layoutParams
+        val layoutParams = controls.layoutParams as LinearLayout.LayoutParams
         val expandedLayoutHeight = layoutParams.height
+        // queryControls 展开时有 13dp 上间距。若只动画高度而不动画间距，
+        // 展开第一帧会先向下跳 13dp、收起结束时会因为间距突然消失而向上弹一下。
+        val expandedTopMargin = layoutParams.topMargin
         val startHeight: Int
         val endHeight: Int
         if (expanding) {
@@ -2553,6 +2564,7 @@ class MainActivity : ComponentActivity() {
                 controls.measuredHeight
             }
             layoutParams.height = 0
+            layoutParams.topMargin = 0
         } else {
             startHeight = controls.height.coerceAtLeast(controls.measuredHeight)
             endHeight = 0
@@ -2565,6 +2577,11 @@ class MainActivity : ComponentActivity() {
             addUpdateListener { animator ->
                 val fraction = animator.animatedFraction
                 layoutParams.height = animator.animatedValue as Int
+                layoutParams.topMargin = if (expanding) {
+                    (expandedTopMargin * fraction).toInt()
+                } else {
+                    (expandedTopMargin * (1f - fraction)).toInt()
+                }
                 controls.layoutParams = layoutParams
                 controls.alpha = if (expanding) fraction else 1f - fraction
                 controls.translationY = if (expanding) -dp(5f) * (1f - fraction) else -dp(5f) * fraction
@@ -2574,6 +2591,7 @@ class MainActivity : ComponentActivity() {
                 override fun onAnimationEnd(animation: android.animation.Animator) {
                     if (expanding) {
                         layoutParams.height = expandedLayoutHeight
+                        layoutParams.topMargin = expandedTopMargin
                         controls.layoutParams = layoutParams
                         controls.alpha = 1f
                         controls.translationY = 0f
@@ -2586,6 +2604,8 @@ class MainActivity : ComponentActivity() {
                         controls.alpha = 1f
                         controls.translationY = 0f
                         layoutParams.height = expandedLayoutHeight
+                        // GONE 时恢复上间距不影响布局，下一次展开才有正确的起始值。
+                        layoutParams.topMargin = expandedTopMargin
                         controls.layoutParams = layoutParams
                     }
                     toggle.contentDescription = if (expanding) "折叠$targetName" else "展开$targetName"
@@ -4272,7 +4292,8 @@ class MainActivity : ComponentActivity() {
         }
         if (account == "114514") {
             val refreshedCourses = recolorCourses(
-                sampleCourses() + loadCustomCourseCache(),
+                preserveCourseNotes(loadImportedCourseCache(), sampleCourses()) +
+                    loadCustomCourseCache(),
                 term = term,
                 refreshMapping = true
             )
@@ -4317,7 +4338,10 @@ class MainActivity : ComponentActivity() {
                         !isActiveAcademicSession(account, term)
                     ) return@runOnUiThread
                     val refreshedCourses = recolorCourses(
-                        coursesFromSystem + loadCustomCourseCache(),
+                        // 刷新会用教务系统的新课程覆盖本地缓存，这里先把已有备注
+                        // 按同名/同教室/同记录合并回来，避免刷新后备注丢失。
+                        preserveCourseNotes(loadImportedCourseCache(), coursesFromSystem) +
+                            loadCustomCourseCache(),
                         term = term,
                         refreshMapping = true
                     )
@@ -10084,6 +10108,27 @@ class MainActivity : ComponentActivity() {
         val recolored = recolorCourses(updated)
         if (original.isCustom) saveCustomCourseCache(recolored) else saveCourseCache(recolored)
         scheduleGrid?.setCourses(loadCourseCache())
+    }
+
+    /**
+     * 刷新/重新登录时，用教务系统的新课程覆盖本地缓存前，先把旧缓存里的备注合并回来：
+     * 考试时间按同名课程，手机袋按同名同教室，自定义备注按同一条课程记录。
+     * 备注只存在本地，刷新不应把它清掉。
+     */
+    private fun preserveCourseNotes(previous: List<Course>, incoming: List<Course>): List<Course> {
+        if (previous.isEmpty() || incoming.isEmpty()) return incoming
+        return incoming.map { course ->
+            var result = course
+            val sameName = previous.filter { it.name == course.name }
+            sameName.firstOrNull { it.examNote.isNotBlank() }
+                ?.let { result = result.copy(examNote = it.examNote) }
+            sameName.firstOrNull { it.room == course.room && it.bagNote.isNotBlank() }
+                ?.let { result = result.copy(bagNote = it.bagNote) }
+            previous.firstOrNull { sameCourseContent(it, course) }?.let {
+                result = result.copy(customNote = it.customNote, customNoteWeek = it.customNoteWeek)
+            }
+            result
+        }
     }
 
     /**

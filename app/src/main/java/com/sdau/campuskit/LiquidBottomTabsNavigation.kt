@@ -1429,9 +1429,13 @@ internal fun LiquidBottomTabs(
                     layerBlock = {
                         scaleX = dampedDragAnimation.scaleX
                         scaleY = dampedDragAnimation.scaleY
-                        val velocity = dampedDragAnimation.velocity / 10f
-                        scaleX /= 1f - (velocity * 0.75f).fastCoerceIn(-0.2f, 0.2f)
-                        scaleY *= 1f - (velocity * 0.25f).fastCoerceIn(-0.2f, 0.2f)
+                        // reference 样式（登录页切换条）不做速度拉伸，避免快速滑动时
+                        // 指示器被拉出轨道，出现“灰色框超出来一块”。
+                        if (!referenceStyle) {
+                            val velocity = dampedDragAnimation.velocity / 10f
+                            scaleX /= 1f - (velocity * 0.75f).fastCoerceIn(-0.2f, 0.2f)
+                            scaleY *= 1f - (velocity * 0.25f).fastCoerceIn(-0.2f, 0.2f)
+                        }
                     },
                     onDrawSurface = {
                         val progress = dampedDragAnimation.pressProgress
