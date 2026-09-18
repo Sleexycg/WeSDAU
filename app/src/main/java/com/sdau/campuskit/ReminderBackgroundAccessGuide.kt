@@ -150,7 +150,7 @@ internal class ReminderBackgroundAccessGuide(
                 context = activity,
                 pageSnapshot = snapshot,
                 title = "检查后台省电策略",
-                message = "点击“去设置”按钮将弹出应用设置页面，请在“省电策略”或“电池”中选择“无限制”。如有“电池优化”选项，请设为“不优化”",
+                message = "为保障消息通知稳定，请将本应用的省电策略设置为「不优化」，并允许应用自启动。",
                 cancelLabel = "取消",
                 confirmLabel = "去设置",
                 onDismiss = {

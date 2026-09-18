@@ -83,6 +83,7 @@ import org.json.JSONObject
 import com.google.android.material.textfield.MaterialAutoCompleteTextView
 import java.text.SimpleDateFormat
 import java.util.Calendar
+import java.util.Date
 import java.util.Locale
 import java.io.File
 import java.io.FileInputStream
@@ -283,7 +284,6 @@ class MainActivity : ComponentActivity() {
     private var dormRechargeVerificationGeneration = 0
     private var dormRechargeVerificationRunnable: Runnable? = null
     private var pendingDormPayment: DormPendingPayment? = null
-    private var shareOverlay: View? = null
     private var actionMenuOverlay: LiquidActionMenuView? = null
     private var backgroundEditorOverlay: LiquidBackgroundEditorView? = null
     private var backgroundEditorPendingSource: File? = null
@@ -304,7 +304,6 @@ class MainActivity : ComponentActivity() {
     private var updateDialogView: LiquidUpdateDialogView? = null
     private var updateDialogCapturePending = false
     private var announcementDialogCapturePending = false
-    private var pickerDialogCapturePending = false
     private var actionMenuCapturePending = false
     private var scoreTermMenuCapturePending = false
     private var scoreReminderCapturePending = false
@@ -975,7 +974,6 @@ class MainActivity : ComponentActivity() {
         publicOptionOverlay?.releaseSnapshot()
         publicOptionOverlay = null
         publicOptionPickerCapturePending = false
-        shareOverlay = null
         swapPage(buildLoginPage(), false, animate)
     }
 
@@ -1288,6 +1286,12 @@ class MainActivity : ComponentActivity() {
                 swapPage(buildLoginPage(), false, false)
             }, spacedParams(dp(14)))
             buildPublicFilterFields(form, selectedTerm)
+            publicScheduleUpdatedLabel(selectedTerm)?.let { updated ->
+                form.addView(
+                    text(updated, 12f, campusAndroidColors(this).secondaryText, Typeface.NORMAL),
+                    spacedParams(dp(10))
+                )
+            }
         }
 
         loginStatus = text("", 13f, campusAndroidColors(this).error, Typeface.NORMAL).apply {
@@ -4413,7 +4417,8 @@ class MainActivity : ComponentActivity() {
                     LiquidMenuAction(
                         title = "分享",
                         iconRes = R.drawable.ic_share,
-                        onClick = { hideActionMenu { showSharePicker() } }
+                        hasSubmenu = true,
+                        onClick = { menu.showShareActions() }
                     )
                 )
                 add(
@@ -4460,6 +4465,35 @@ class MainActivity : ComponentActivity() {
                     onClick = { hideActionMenu { clearCustomBackground() } }
                 )
             )
+            val shareActions = listOf(
+                LiquidMenuAction(
+                    title = "分享",
+                    iconRes = R.drawable.ic_expand_chevron,
+                    isBackAction = true,
+                    dividerAfter = true,
+                    onClick = { menu.showRootActions() }
+                ),
+                LiquidMenuAction(
+                    title = "导出本周课表图片",
+                    iconRes = R.drawable.ic_share_image,
+                    onClick = { hideActionMenu { saveSchedulePng(includeAllWeeks = false) } }
+                ),
+                LiquidMenuAction(
+                    title = "导出本学期课表图片",
+                    iconRes = R.drawable.ic_share_image,
+                    onClick = { hideActionMenu { saveSchedulePng(includeAllWeeks = true) } }
+                ),
+                LiquidMenuAction(
+                    title = "导出为CSV",
+                    iconRes = R.drawable.ic_share_spreadsheet,
+                    onClick = { hideActionMenu { shareCsv() } }
+                ),
+                LiquidMenuAction(
+                    title = "分享APP",
+                    iconRes = R.drawable.ic_share_app,
+                    onClick = { hideActionMenu { shareApp() } }
+                )
+            )
             menu = LiquidActionMenuView(
                 context = this,
                 pageSnapshot = pageSnapshot,
@@ -4467,6 +4501,7 @@ class MainActivity : ComponentActivity() {
                 menuY = menuY,
                 actions = actions,
                 backgroundActions = backgroundActions,
+                shareActions = shareActions,
                 hasCustomBackground = customBackgroundAvailable,
                 onDismiss = { hideActionMenu() }
             )
@@ -5572,8 +5607,12 @@ class MainActivity : ComponentActivity() {
             )
         }
 
-        val visibleCourses = if (includeAllWeeks) courses else courses.filter {
-            courseVisibleOnScheduleDate(it, term, week)
+        val visibleCourses = if (includeAllWeeks) {
+            // 整学期导出只包含“在某一周真实可见”的课程，避免历史残留/无效周数的
+            // 课程只在导出图里出现（这些课程在周课表中永远看不到）。
+            courses.filter { course -> (1..20).any { courseVisibleOnScheduleDate(course, term, it) } }
+        } else {
+            courses.filter { courseVisibleOnScheduleDate(it, term, week) }
         }
         buildExportCoursePlacements(visibleCourses).forEach { placement ->
             val course = placement.course
@@ -5661,13 +5700,12 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    private fun saveSchedulePng() {
+    private fun saveSchedulePng(includeAllWeeks: Boolean = includeWholeTermInScheduleExport()) {
         if (scheduleExporting) return
         val term = activeScheduleTerm()
         val week = currentWeek
         val mode = scheduleMode
         val courses = activeScheduleCourses()
-        val includeAllWeeks = includeWholeTermInScheduleExport()
         if (courses.isEmpty()) {
             Toast.makeText(this, "课表尚未准备好", Toast.LENGTH_SHORT).show()
             return
@@ -6224,14 +6262,8 @@ class MainActivity : ComponentActivity() {
         )
     }
 
-    private fun shareWeekPng() {
-        saveSchedulePng()
-        hideSharePicker()
-    }
-
     private fun shareCsv() {
         createCourseFiles()?.second?.let { shareSingleFile(it, "text/csv", "分享课程 CSV") }
-        hideSharePicker()
     }
 
     private fun shareApp() {
@@ -6247,66 +6279,6 @@ class MainActivity : ComponentActivity() {
                 durationMillis = 2_800L
             )
         }
-        hideSharePicker()
-    }
-
-    private fun showSharePicker() {
-        if (shareOverlay != null || pickerDialogCapturePending) return
-        pickerDialogCapturePending = true
-        captureUpdateBackdrop { pageSnapshot ->
-            pickerDialogCapturePending = false
-            if (isFinishing || isDestroyed || shareOverlay != null) {
-                pageSnapshot?.takeUnless(Bitmap::isRecycled)?.recycle()
-                return@captureUpdateBackdrop
-            }
-            val dialog = LiquidPickerDialogView(
-                context = this,
-                pageSnapshot = pageSnapshot,
-                title = "分享",
-                options = listOf(
-                    LiquidPickerOption(
-                        title = when {
-                            viewingPublicSchedule -> "导出本专业课表为PNG"
-                            isHistoricalPersonalTerm() -> "导出本学期课表为PNG"
-                            else -> "导出本周课表为PNG"
-                        },
-                        subtitle = when {
-                            viewingPublicSchedule -> "包含课程周数"
-                            isHistoricalPersonalTerm() -> "包含本学期全部课程及课程周数"
-                            else -> "保存当前周课表图片"
-                        },
-                        iconRes = R.drawable.ic_share_image,
-                        onClick = ::shareWeekPng
-                    ),
-                    LiquidPickerOption(
-                        title = "分享CSV文件",
-                        subtitle = "可直接导入WakeUp课程表",
-                        iconRes = R.drawable.ic_share_spreadsheet,
-                        onClick = ::shareCsv
-                    ),
-                    LiquidPickerOption(
-                        title = "分享 APP",
-                        subtitle = "WeSDAU课程表安装包",
-                        iconRes = R.drawable.ic_share_app,
-                        onClick = ::shareApp
-                    )
-                ),
-                onDismiss = ::hideSharePicker
-            )
-            pageHost.addView(dialog, matchParentParams())
-            shareOverlay = dialog
-            dialog.alpha = 0f
-            dialog.animate().alpha(1f).setDuration(180).start()
-        }
-    }
-
-    private fun hideSharePicker() {
-        val overlay = shareOverlay ?: return
-        overlay.animate().alpha(0f).setDuration(140).withEndAction {
-            pageHost.removeView(overlay)
-            (overlay as? LiquidPickerDialogView)?.releaseSnapshot()
-            shareOverlay = null
-        }.start()
     }
 
     private fun courseVisibleInWeek(course: Course, week: Int): Boolean =
@@ -6748,6 +6720,28 @@ class MainActivity : ComponentActivity() {
         return "${publicScheduleHashKey(term)}_lookup"
     }
 
+    private fun publicScheduleUpdatedKey(term: String): String {
+        val safeTerm = term.replace(Regex("[^A-Za-z0-9_-]"), "_")
+        return "$KEY_PUBLIC_SCHEDULE_UPDATED_PREFIX$safeTerm"
+    }
+
+    /** 全校课表最后一次成功下载更新的时间；旧版本没有记录时回退到缓存文件修改时间。 */
+    private fun publicScheduleLastUpdatedAt(term: String): Long {
+        if (term.isBlank()) return 0L
+        val stored = getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
+            .getLong(publicScheduleUpdatedKey(term), 0L)
+        if (stored > 0L) return stored
+        val file = publicScheduleFile(term)
+        return if (file.isFile && file.length() > 0L) file.lastModified() else 0L
+    }
+
+    private fun publicScheduleUpdatedLabel(term: String): String? {
+        val timestamp = publicScheduleLastUpdatedAt(term)
+        if (timestamp <= 0L) return null
+        val formatted = SimpleDateFormat("yyyy-MM-dd HH:mm", Locale.CHINA).format(Date(timestamp))
+        return "最近更新：$formatted"
+    }
+
     private fun hasPublicScheduleLookup(term: String): Boolean {
         if (term.isBlank()) return false
         val file = publicScheduleLookupFile(term)
@@ -6816,6 +6810,7 @@ class MainActivity : ComponentActivity() {
         getSharedPreferences(PREFS_NAME, MODE_PRIVATE).edit()
             .putString(KEY_PUBLIC_SCHEDULE_SYNCED_TERM, term)
             .putString(publicScheduleHashKey(term), sha256)
+            .putLong(publicScheduleUpdatedKey(term), System.currentTimeMillis())
             .apply()
         return index
     }
@@ -7219,6 +7214,10 @@ class MainActivity : ComponentActivity() {
                 put("background", course.background)
                 put("foreground", course.foreground)
                 put("isCustom", course.isCustom)
+                put("bagNote", course.bagNote)
+                put("examNote", course.examNote)
+                put("customNote", course.customNote)
+                put("customNoteWeek", course.customNoteWeek)
             })
         }
         getSharedPreferences(PREFS_NAME, MODE_PRIVATE).edit()
@@ -7386,7 +7385,11 @@ class MainActivity : ComponentActivity() {
                         item.getInt("day"), item.getInt("startSlot"), item.getInt("slotCount"),
                         item.getString("name"), normalizeClassroomName(item.getString("room")), item.getString("teacher"),
                         item.getInt("background"), item.getInt("foreground"), item.optString("weeks", ""),
-                        isCustom = isCustom
+                        isCustom = isCustom,
+                        bagNote = item.optString("bagNote", ""),
+                        examNote = item.optString("examNote", ""),
+                        customNote = item.optString("customNote", ""),
+                        customNoteWeek = item.optInt("customNoteWeek", -1)
                     ))
                 }
             }
@@ -8045,7 +8048,14 @@ class MainActivity : ComponentActivity() {
         val background: Int,
         val foreground: Int,
         val weeks: String = "",
-        val isCustom: Boolean = false
+        val isCustom: Boolean = false,
+        /** 手机袋号码：课程级备注，同步到同名课程的所有周与节次。 */
+        val bagNote: String = "",
+        /** 考试时间：课程级备注，同步到同名课程的所有周与节次。 */
+        val examNote: String = "",
+        /** 自定义备注：仅归属设置它的那周那节课。 */
+        val customNote: String = "",
+        val customNoteWeek: Int = -1
     )
 
     private data class CoursePlacement(
@@ -9898,10 +9908,33 @@ class MainActivity : ComponentActivity() {
                 initialSlotCount = course.slotCount,
                 maxSlotCount = 10 - course.startSlot,
                 allowDurationEdit = course.isCustom,
+                bagNote = course.bagNote,
+                examNote = course.examNote,
+                customNote = course.customNote.takeIf { course.customNoteWeek == currentWeek }.orEmpty(),
+                canEditNotes = !viewingPublicSchedule,
                 onSave = { name, room, teacher, weeks, slotCount ->
                     updateCourseCache(course, name, room, teacher, weeks, slotCount)
                     hideCourseDetails()
                 },
+                onSaveNotes = { bag, exam, custom ->
+                    // 三个备注全为空时点确认视为清空，不弹 toast；
+                    // 原本无备注 → “备注已添加”，原本有备注 → “备注已修改”。
+                    val hadNotes = course.bagNote.isNotBlank() ||
+                        course.examNote.isNotBlank() ||
+                        (course.customNote.isNotBlank() && course.customNoteWeek == currentWeek)
+                    saveCourseNotes(course, bag, exam, custom)
+                    val hasNotes = bag.isNotBlank() || exam.isNotBlank() || custom.isNotBlank()
+                    if (hasNotes) {
+                        showLiquidToast(
+                            message = if (hadNotes) "备注已修改" else "备注已添加",
+                            visual = LiquidToastVisual.SUCCESS,
+                            durationMillis = 2_200L
+                        )
+                    }
+                    // 备注保存后直接关闭弹窗回到课表主页，不再回到修改课程页。
+                    hideCourseDetails()
+                },
+                onKeyboardClose = ::hideKeyboard,
                 onDelete = if (!viewingPublicSchedule) {
                     {
                         if (!deletionRequested) {
@@ -10053,6 +10086,38 @@ class MainActivity : ComponentActivity() {
         scheduleGrid?.setCourses(loadCourseCache())
     }
 
+    /**
+     * 保存课程备注。
+     * 手机袋号码：每节课独立，仅同步“同名且同教室”的课程（同一门课在不同地点上课互不影响）；
+     * 考试时间：课程级备注，同步到同名课程的所有周与节次；
+     * 自定义备注：只归属当前查看的那一周的那一节课。
+     */
+    private fun saveCourseNotes(original: Course, bag: String, exam: String, custom: String) {
+        val source = if (original.isCustom) loadCustomCourseCache() else loadImportedCourseCache()
+        val updated = source.map { current ->
+            var result = current
+            if (current.name == original.name) {
+                // 考试时间：同步到所有同名课程的所有周与节次。
+                result = result.copy(examNote = exam)
+                // 手机袋号码：仅同名且同教室的课程才同步。
+                if (current.room == original.room) result = result.copy(bagNote = bag)
+            }
+            // 自定义备注：仅当前周的本节课。这里必须独立判断，不能与上面的条件互斥，
+            // 否则同一门课修改手机袋号码时自定义备注会被跳过。
+            if (sameCourseRecord(current, original)) {
+                val limitedCustom = custom.take(12)
+                result = result.copy(
+                    customNote = limitedCustom,
+                    customNoteWeek = if (limitedCustom.isNotBlank()) currentWeek else -1
+                )
+            }
+            result
+        }
+        val recolored = recolorCourses(updated)
+        if (original.isCustom) saveCustomCourseCache(recolored) else saveCourseCache(recolored)
+        scheduleGrid?.setCourses(loadCourseCache())
+    }
+
     private fun deleteCourseFromCache(course: Course) {
         if (viewingPublicSchedule) return
         val account = getSharedPreferences(PREFS_NAME, MODE_PRIVATE).getString(KEY_ACCOUNT, "").orEmpty()
@@ -10060,8 +10125,15 @@ class MainActivity : ComponentActivity() {
         val source = if (course.isCustom) loadCustomCourseCache() else loadImportedCourseCache()
         val deletion = CourseDeletionUndo.capture(source) { sameCourseRecord(it, course) }
         if (!deletion.hasRemovedCourses) return
+        // 同一门课可能同时存在于导入缓存和自定义缓存（历史版本的合并缓存或重复添加）。
+        // 仅按课程内容匹配清理镜像缓存，避免导出整学期课表时残留已删除的课程。
+        val mirrorSource = if (course.isCustom) loadImportedCourseCache() else loadCustomCourseCache()
+        val mirrorDeletion = CourseDeletionUndo.capture(mirrorSource) { sameCourseContent(it, course) }
         val recolored = recolorCourses(deletion.remaining)
         if (course.isCustom) saveCustomCourseCache(recolored) else saveCourseCache(recolored)
+        if (mirrorDeletion.hasRemovedCourses) {
+            if (course.isCustom) saveCourseCache(mirrorDeletion.remaining) else saveCustomCourseCache(mirrorDeletion.remaining)
+        }
         scheduleGrid?.animateCourseRemoval(course, loadCourseCache())
         var restored = false
         showLiquidToast(
@@ -10080,6 +10152,11 @@ class MainActivity : ComponentActivity() {
                 val latest = if (course.isCustom) loadCustomCourseCache() else loadImportedCourseCache()
                 val recovered = recolorCourses(deletion.restoreInto(latest, ::sameCourseRecord))
                 if (course.isCustom) saveCustomCourseCache(recovered) else saveCourseCache(recovered)
+                if (mirrorDeletion.hasRemovedCourses) {
+                    val latestMirror = if (course.isCustom) loadImportedCourseCache() else loadCustomCourseCache()
+                    val recoveredMirror = mirrorDeletion.restoreInto(latestMirror, ::sameCourseContent)
+                    if (course.isCustom) saveCourseCache(recoveredMirror) else saveCustomCourseCache(recoveredMirror)
+                }
                 // setCourses also cancels an unfinished removal animation.
                 scheduleGrid?.setCourses(loadCourseCache())
                 showLiquidToast("已撤回删除", LiquidToastVisual.SUCCESS)
@@ -10088,14 +10165,17 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun sameCourseRecord(first: Course, second: Course): Boolean =
+        sameCourseContent(first, second) && first.isCustom == second.isCustom
+
+    /** 课程内容匹配，忽略“自定义/导入”来源，用于跨缓存去重清理。 */
+    private fun sameCourseContent(first: Course, second: Course): Boolean =
         first.day == second.day &&
             first.startSlot == second.startSlot &&
             first.slotCount == second.slotCount &&
             first.name == second.name &&
             first.room == second.room &&
             first.teacher == second.teacher &&
-            first.weeks == second.weeks &&
-            first.isCustom == second.isCustom
+            first.weeks == second.weeks
 
     private fun hideCourseDetails() {
         val overlay = detailOverlay ?: return
@@ -10272,7 +10352,6 @@ class MainActivity : ComponentActivity() {
         dormElectricityOverlay = null
         invalidateDormRequests()
         dormPaymentQrResolver.dispose()
-        (shareOverlay as? LiquidPickerDialogView)?.releaseSnapshot()
         actionMenuOverlay?.releaseSnapshot()
         backgroundEditorOverlay?.releaseBitmap()
         backgroundEditorOverlay = null
@@ -10311,6 +10390,7 @@ class MainActivity : ComponentActivity() {
         private const val KEY_COURSES = "courses_cache"
         private const val KEY_PUBLIC_SCHEDULE_SYNCED_TERM = "public_schedule_synced_term"
         private const val KEY_PUBLIC_SCHEDULE_HASH_PREFIX = "public_schedule_sha256_"
+        private const val KEY_PUBLIC_SCHEDULE_UPDATED_PREFIX = "public_schedule_updated_at_"
         private const val KEY_PUBLIC_LAST_COLLEGE = "public_last_college"
         private const val KEY_PUBLIC_LAST_GRADE = "public_last_grade"
         private const val KEY_PUBLIC_LAST_MAJOR = "public_last_major"

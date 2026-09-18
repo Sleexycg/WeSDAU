@@ -58,7 +58,9 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.drawWithContent
+import androidx.compose.ui.geometry.CornerRadius
 import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Rect
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.BlendMode
 import androidx.compose.ui.graphics.Brush
@@ -224,6 +226,7 @@ internal class CampusLiquidBottomTabsView(
                             containerHeight = 54.dp,
                             indicatorHeight = 46.dp,
                             indicatorInset = if (themeColors.isDark) 1.dp else 0.dp,
+                            indicatorOutset = 1.dp,
                             containerSurfaceAlpha = 0.34f,
                             modifier = Modifier
                                 .width(216.dp)
@@ -1129,6 +1132,8 @@ internal fun LiquidBottomTabs(
     indicatorLensVertical: Dp = 14.dp,
     indicatorInset: Dp = 0.dp,
     indicatorChromaticAberration: Boolean = true,
+    /** 选中指示器四边凸出轨道的宽度：0 表示不凸出；>0 时指示器比轨道高出一圈并加白色外描边（主页导航玻璃珠效果）。 */
+    indicatorOutset: Dp = 0.dp,
     containerSurfaceAlpha: Float? = null,
     restingIndicatorAlpha: Float = 0.10f,
     indicatorShadowEnabled: Boolean = referenceStyle,
@@ -1176,8 +1181,23 @@ internal fun LiquidBottomTabs(
             (constraints.maxWidth.toFloat() - horizontalInsetPx * 2f) / tabsCount
         }
         val tabWidthDp = with(density) { tabWidth.toDp() }
-        val indicatorWidth = (tabWidthDp - indicatorInset * 2f).coerceAtLeast(0.dp)
-        val indicatorVisualHeight = (indicatorHeight - indicatorInset * 2f).coerceAtLeast(0.dp)
+        val indicatorOutsetPx = with(density) { indicatorOutset.toPx() }
+        // reference 样式指示器缩进轨道（窄一圈）；带 outset 时四边均匀凸出轨道，
+        // 并横向加长形成扁长胶囊。
+        val indicatorExtraWidth = with(density) { 8.dp.toPx() }
+        val indicatorWidth = if (referenceStyle) {
+            (tabWidthDp - indicatorInset * 2f).coerceAtLeast(0.dp)
+        } else if (indicatorOutsetPx > 0f) {
+            tabWidthDp + indicatorOutset * 2 + 8.dp
+        } else {
+            tabWidthDp
+        }
+        val indicatorVisualHeight = when {
+            referenceStyle -> (indicatorHeight - indicatorInset * 2f).coerceAtLeast(0.dp)
+            // 与左右凸出量一致：轨道可见高度基础上四边各凸 indicatorOutset。
+            indicatorOutsetPx > 0f -> indicatorHeight + indicatorOutset * 2
+            else -> indicatorHeight
+        }
         val offsetAnimation = remember { Animatable(0f) }
         val panelOffset by remember(density) {
             derivedStateOf {
@@ -1277,7 +1297,8 @@ internal fun LiquidBottomTabs(
                     effects = {
                         vibrancy()
                         blur(8f.dp.toPx())
-                        lens(24f.dp.toPx(), 24f.dp.toPx())
+                        // 外框的彩虹折射：大半径透镜 + 色散，边缘分光更接近例图。
+                        lens(28f.dp.toPx(), 28f.dp.toPx(), chromaticAberration = true)
                     },
                     layerBlock = {
                         val progress = dampedDragAnimation.pressProgress
@@ -1350,11 +1371,18 @@ internal fun LiquidBottomTabs(
         Box(
             Modifier
                 .graphicsLayer {
+                    // reference 样式指示器缩进轨道（+inset）；带 outset 的样式指示器凸出轨道（-outset），
+                    // 保证比 tab 宽一圈时仍与 tab 居中对齐。
+                    val baseOffset = when {
+                        referenceStyle -> indicatorInsetPx
+                        indicatorOutsetPx > 0f -> -(indicatorOutsetPx + indicatorExtraWidth / 2f)
+                        else -> 0f
+                    }
                     translationX =
                         if (isLtr) horizontalInsetPx +
-                            indicatorValue * tabWidth + indicatorInsetPx + panelOffset
+                            indicatorValue * tabWidth + baseOffset + panelOffset
                         else constraints.maxWidth.toFloat() - horizontalInsetPx -
-                            (indicatorValue + 1f) * tabWidth + indicatorInsetPx + panelOffset
+                            (indicatorValue + 1f) * tabWidth + baseOffset + panelOffset
                 }
                 .then(interactiveHighlight.gestureModifier)
                 .then(dampedDragAnimation.modifier)
@@ -1363,11 +1391,20 @@ internal fun LiquidBottomTabs(
                     shape = { Capsule() },
                     effects = {
                         val progress = dampedDragAnimation.pressProgress
-                        lens(
-                            indicatorLensHorizontal.toPx() * progress,
-                            indicatorLensVertical.toPx() * progress,
-                            chromaticAberration = indicatorChromaticAberration
-                        )
+                        if (indicatorOutsetPx > 0f) {
+                            // 主页导航玻璃珠：静止即大半径透镜（彩虹折射边），按压增强到 34f。
+                            lens(
+                                lerp(28f, 34f, progress),
+                                lerp(28f, 34f, progress),
+                                chromaticAberration = indicatorChromaticAberration
+                            )
+                        } else {
+                            lens(
+                                indicatorLensHorizontal.toPx() * progress,
+                                indicatorLensVertical.toPx() * progress,
+                                chromaticAberration = indicatorChromaticAberration
+                            )
+                        }
                     },
                     highlight = {
                         Highlight.Default.copy(
@@ -1398,11 +1435,33 @@ internal fun LiquidBottomTabs(
                     },
                     onDrawSurface = {
                         val progress = dampedDragAnimation.pressProgress
-                        drawRect(
-                            (if (themeColors.isDark) Color.White else Color.Black)
-                                .copy(restingIndicatorAlpha),
-                            alpha = 1f - progress
-                        )
+                        if (indicatorOutsetPx > 0f) {
+                            // 主页导航：默认灰色框与外框同为正胶囊（圆角=高度一半），
+                            // 与外框四周留出一致的 2px 间隙，不随玻璃珠的凸出变形。
+                            val gapPx = with(density) { 2.dp.toPx() }
+                            val insetX = indicatorOutsetPx + indicatorExtraWidth / 2f + gapPx
+                            val insetY = indicatorOutsetPx + gapPx
+                            val rect = Rect(
+                                left = insetX,
+                                top = insetY,
+                                right = size.width - insetX,
+                                bottom = size.height - insetY
+                            )
+                            drawRoundRect(
+                                (if (themeColors.isDark) Color.White else Color.Black)
+                                    .copy(restingIndicatorAlpha),
+                                topLeft = rect.topLeft,
+                                size = rect.size,
+                                cornerRadius = CornerRadius(rect.height / 2f),
+                                alpha = 1f - progress
+                            )
+                        } else {
+                            drawRect(
+                                (if (themeColors.isDark) Color.White else Color.Black)
+                                    .copy(restingIndicatorAlpha),
+                                alpha = 1f - progress
+                            )
+                        }
                         if (referenceStyle) {
                             drawRect(Color.Black.copy(alpha = 0.03f * progress))
                         }
@@ -1412,6 +1471,31 @@ internal fun LiquidBottomTabs(
                 .width(indicatorWidth),
             contentAlignment = Alignment.Center
         ) {}
+
+        // 白色描边必须是最后一个子元素（最顶层）：玻璃珠在最左/最右时会横向超出
+        // 轨道边缘，描边画在更早的层级会被玻璃珠盖住，导致两端缺失。
+        if (indicatorOutsetPx > 0f) {
+            Box(
+                Modifier
+                    .graphicsLayer { translationX = panelOffset }
+                    .matchParentSize()
+                    // 白描边带垂直渐变过渡：顶部/底部淡出、中段最亮（对齐例图效果）。
+                    .border(
+                        1.dp,
+                        Brush.verticalGradient(
+                            colors = listOf(
+                                Color.White.copy(alpha = 0f),
+                                if (themeColors.isDark) Color.White.copy(alpha = 0.30f)
+                                else Color.White.copy(alpha = 0.55f),
+                                if (themeColors.isDark) Color.White.copy(alpha = 0.30f)
+                                else Color.White.copy(alpha = 0.55f),
+                                Color.White.copy(alpha = 0f)
+                            )
+                        ),
+                        shape = Capsule()
+                    )
+            )
+        }
     }
 }
 

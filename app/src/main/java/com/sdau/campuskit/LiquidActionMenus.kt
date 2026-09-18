@@ -149,11 +149,13 @@ internal class LiquidActionMenuView(
     menuY: Int,
     actions: List<LiquidMenuAction>,
     backgroundActions: List<LiquidMenuAction> = emptyList(),
+    shareActions: List<LiquidMenuAction> = emptyList(),
     hasCustomBackground: Boolean,
     onDismiss: () -> Unit
 ) : FrameLayout(context) {
     private var rootActions = actions
     private val secondaryBackgroundActions = backgroundActions
+    private val secondaryShareActions = shareActions
     private var updateStatus by mutableStateOf("")
     private var checkingUpdate by mutableStateOf(false)
     private var menuActions by mutableStateOf(actions)
@@ -216,6 +218,12 @@ internal class LiquidActionMenuView(
     fun showBackgroundActions() {
         if (secondaryBackgroundActions.isNotEmpty()) {
             menuActions = secondaryBackgroundActions
+        }
+    }
+
+    fun showShareActions() {
+        if (secondaryShareActions.isNotEmpty()) {
+            menuActions = secondaryShareActions
         }
     }
 
@@ -459,6 +467,8 @@ private fun LiquidActionMenu(
                     ) {
                         BasicText(
                             action.title,
+                            maxLines = 1,
+                            softWrap = false,
                             style = TextStyle(
                                 contentColor.copy(alpha = if (action.enabled) 1f else 0.68f),
                                 14.sp,

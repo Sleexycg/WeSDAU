@@ -13,10 +13,15 @@ import android.view.ViewTreeObserver
 import android.view.inputmethod.EditorInfo
 import android.widget.EditText
 import android.widget.FrameLayout
+import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.spring
 import androidx.compose.animation.core.tween
 import androidx.compose.animation.animateContentSize
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.animation.scaleIn
+import androidx.compose.animation.scaleOut
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
@@ -30,6 +35,7 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.ExperimentalLayoutApi
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
@@ -72,6 +78,7 @@ import androidx.compose.ui.semantics.role
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.kyant.backdrop.Backdrop
@@ -87,6 +94,24 @@ import com.kyant.shapes.Capsule
 import com.kyant.shapes.RoundedRectangle
 import kotlin.math.roundToInt
 import kotlinx.coroutines.delay
+
+/** 自定义备注最多 12 个字。 */
+private const val CUSTOM_NOTE_MAX_LENGTH = 12
+
+/**
+ * 按显示宽度截断：一个汉字（含全角字符）计 1，字母/数字等半角字符计 0.5，
+ * 总宽超过 [maxHan] 时丢弃多余部分——超出字符直接输不进去。
+ */
+private fun limitByHanWidth(input: String, maxHan: Int): String {
+    var width = 0f
+    input.forEachIndexed { index, ch ->
+        val w = if (ch.code > 0x2E7F) 1f else 0.5f
+        if (width + w > maxHan) return input.substring(0, index)
+        width += w
+    }
+    return input
+}
+
 /** Course details and editing form. */
 internal class LiquidCourseDialogView(
     context: Context,
@@ -102,6 +127,10 @@ internal class LiquidCourseDialogView(
     initialSlotCount: Int = 1,
     maxSlotCount: Int = 1,
     allowDurationEdit: Boolean = false,
+    bagNote: String = "",
+    examNote: String = "",
+    customNote: String = "",
+    canEditNotes: Boolean = false,
     onSave: (
         name: String,
         room: String,
@@ -109,10 +138,15 @@ internal class LiquidCourseDialogView(
         weeks: String,
         slotCount: Int
     ) -> Unit,
+    onSaveNotes: (bag: String, exam: String, custom: String) -> Unit = { _, _, _ -> },
     onDelete: (() -> Unit)? = null,
-    onDismiss: () -> Unit
+    onDismiss: () -> Unit,
+    /** 保存备注后由宿主收起输入法。 */
+    onKeyboardClose: () -> Unit = {}
 ) : FrameLayout(context) {
     private val hostImeVisible = mutableStateOf(false)
+    // 输入法实时高度（px）：直接用系统分发的 inset 驱动卡片位移，键盘下落时卡片能同步跟随。
+    private val hostImeHeightPx = mutableStateOf(0f)
     private val visibleWindowFrame = Rect()
     private val keyboardLayoutListener = ViewTreeObserver.OnGlobalLayoutListener {
         updateImeVisibilityFromWindow()
@@ -127,6 +161,8 @@ internal class LiquidCourseDialogView(
             val visible = insets.isVisible(WindowInsetsCompat.Type.ime()) ||
                 imeInsets.bottom > navigationInsets.bottom
             if (hostImeVisible.value != visible) hostImeVisible.value = visible
+            val height = if (visible) imeInsets.bottom.toFloat() else 0f
+            if (hostImeHeightPx.value != height) hostImeHeightPx.value = height
             insets
         }
         addView(
@@ -144,10 +180,17 @@ internal class LiquidCourseDialogView(
                     initialSlotCount = initialSlotCount,
                     maxSlotCount = maxSlotCount,
                     allowDurationEdit = allowDurationEdit,
+                    bagNote = bagNote,
+                    examNote = examNote,
+                    customNote = customNote,
+                    canEditNotes = canEditNotes,
                     hostImeVisible = hostImeVisible.value,
+                    hostImeHeightPx = hostImeHeightPx.value,
                     onSave = onSave,
+                    onSaveNotes = onSaveNotes,
                     onDelete = onDelete,
-                    onDismiss = onDismiss
+                    onDismiss = onDismiss,
+                    onKeyboardClose = onKeyboardClose
                 )
             },
             LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.MATCH_PARENT)
@@ -181,6 +224,7 @@ internal class LiquidCourseDialogView(
         } == true
         val visible = visibleFromInsets || obscuredHeight > threshold
         if (hostImeVisible.value != visible) hostImeVisible.value = visible
+        if (!visible && hostImeHeightPx.value != 0f) hostImeHeightPx.value = 0f
     }
 
     fun releaseSnapshot() {
@@ -205,7 +249,12 @@ private fun LiquidCourseDialog(
     initialSlotCount: Int,
     maxSlotCount: Int,
     allowDurationEdit: Boolean,
+    bagNote: String,
+    examNote: String,
+    customNote: String,
+    canEditNotes: Boolean,
     hostImeVisible: Boolean,
+    hostImeHeightPx: Float,
     onSave: (
         name: String,
         room: String,
@@ -213,8 +262,10 @@ private fun LiquidCourseDialog(
         weeks: String,
         slotCount: Int
     ) -> Unit,
+    onSaveNotes: (bag: String, exam: String, custom: String) -> Unit,
     onDelete: (() -> Unit)?,
-    onDismiss: () -> Unit
+    onDismiss: () -> Unit,
+    onKeyboardClose: () -> Unit
 ) {
     val themeColors = CampusComposeTheme.colors
     val contentColor = themeColors.primaryText
@@ -235,22 +286,24 @@ private fun LiquidCourseDialog(
     var teacher by remember(initialTeacher) { mutableStateOf(initialTeacher) }
     var weeks by remember(initialWeeks) { mutableStateOf(initialWeeks) }
     var slotCount by remember(initialSlotCount) { mutableStateOf(initialSlotCount.toString()) }
+    // 备注编辑状态：详情页右下角入口进入编辑后逐项修改。
+    var editingNotes by remember { mutableStateOf(false) }
+    var bagNote by remember(bagNote) { mutableStateOf(bagNote) }
+    var examNote by remember(examNote) { mutableStateOf(examNote) }
+    var customNote by remember(customNote) { mutableStateOf(customNote) }
+    val hasNotes = bagNote.isNotBlank() || examNote.isNotBlank() || customNote.isNotBlank()
+    // 备注窗口标题用进入时的状态，避免编辑过程中清空导致标题来回跳。
+    val initialHasNotes = remember {
+        bagNote.isNotBlank() || examNote.isNotBlank() || customNote.isNotBlank()
+    }
     val availableSlotCount = maxSlotCount.coerceAtLeast(1)
     val imeVisible = hostImeVisible || WindowInsets.isImeVisible
     var keyboardRaised by remember { mutableStateOf(false) }
     LaunchedEffect(imeVisible) {
-        if (imeVisible) {
-            keyboardRaised = true
-        } else {
-            delay(220)
-            keyboardRaised = false
-        }
+        keyboardRaised = imeVisible
     }
-    val keyboardTranslationPx by animateFloatAsState(
-        targetValue = if (keyboardRaised) with(density) { (-118).dp.toPx() } else 0f,
-        animationSpec = tween(durationMillis = 150),
-        label = "courseDialogKeyboardTranslation"
-    )
+    // 位置跟随：直接用系统 imePadding，窗口随输入法的出现/收起动画逐帧同步
+    // 移动（同一套系统动画时序），不会出现弹簧滞后导致的"先卡一下再落下"。
 
     Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
         Box(
@@ -273,18 +326,24 @@ private fun LiquidCourseDialog(
         Box(
             Modifier
                 .fillMaxSize()
-                .clickable(interactionSource = null, indication = null, onClick = onDismiss)
+                .clickable(interactionSource = null, indication = null) {
+                    // 修改课程 / 修改备注时禁止点空白退出，只能通过右上角按钮；
+                    // 浏览详情和新增课程仍可点空白关闭。
+                    if (!editingNotes && (creating || !editing)) onDismiss()
+                }
         )
         Box(
             Modifier.fillMaxSize(),
             contentAlignment = Alignment.Center
         ) {
-            Column(
+            // 课程详情卡片：备注表单在同一张卡片内切换（与修改课程一致的动画），
+            // 卡片尺寸变化由 animateContentSize 平滑过渡。
+            Box(
                 Modifier
                     .padding(horizontal = 28.dp)
                     .fillMaxWidth()
                     .widthIn(max = 372.dp)
-                    .graphicsLayer { translationY = keyboardTranslationPx }
+                    .imePadding()
                     .clip(RoundedRectangle(28.dp))
                     .drawBackdrop(
                         backdrop = backdrop,
@@ -307,6 +366,7 @@ private fun LiquidCourseDialog(
                     .clickable(interactionSource = null, indication = null, onClick = {})
                     .animateContentSize()
             ) {
+            Column(Modifier.fillMaxWidth()) {
             Row(
                 Modifier
                     .fillMaxWidth()
@@ -316,6 +376,9 @@ private fun LiquidCourseDialog(
                 Column(Modifier.weight(1f).padding(end = 10.dp)) {
                     BasicText(
                         when {
+                            // editingNotes 必须先于 editing 判断：备注窗口常从修改课程页进入，
+                            // 此时 editing 仍为 true。
+                            editingNotes -> if (initialHasNotes) "修改备注 · $scheduleTitle" else "设置备注 · $scheduleTitle"
                             creating -> "添加课程 · $scheduleTitle"
                             editing -> "修改课程 · $scheduleTitle"
                             else -> "课程详情"
@@ -329,7 +392,40 @@ private fun LiquidCourseDialog(
                     )
                 }
                 Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-                    if (!editing && canEdit) {
+                    if (editingNotes) {
+                        // 清空备注：一键清空三个输入并保存。
+                        CourseLiquidIconButton(
+                            backdrop = backdrop,
+                            icon = CourseDialogIcon.DELETE,
+                            contentDescription = "清空备注",
+                            onClick = {
+                                bagNote = ""
+                                examNote = ""
+                                customNote = ""
+                                onSaveNotes("", "", "")
+                                keyboardRaised = false
+                                onKeyboardClose()
+                                // 保持 editingNotes 不变：弹窗整体关闭，
+                                // 避免关闭动画期间闪现修改课程页。
+                            }
+                        )
+                        CourseLiquidIconButton(
+                            backdrop = backdrop,
+                            icon = CourseDialogIcon.SAVE,
+                            contentDescription = if (initialHasNotes) "保存备注" else "添加备注",
+                            onClick = {
+                                onSaveNotes(
+                                    bagNote.trim(),
+                                    examNote.trim(),
+                                    customNote.trim()
+                                )
+                                keyboardRaised = false
+                                onKeyboardClose()
+                                // 同上：保持备注画面直到弹窗整体关闭。
+                            }
+                        )
+                    }
+                    if (!editing && !editingNotes && canEdit) {
                         CourseLiquidIconButton(
                             backdrop = backdrop,
                             icon = CourseDialogIcon.EDIT,
@@ -345,7 +441,9 @@ private fun LiquidCourseDialog(
                             )
                         }
                     }
-                    if (editing) {
+                    // 备注窗口从修改课程页进入时 editing 仍为 true，
+                    // 需抑制修改课程的保存键，避免出现两个确认。
+                    if (editing && !editingNotes) {
                         CourseLiquidIconButton(
                             backdrop = backdrop,
                             icon = CourseDialogIcon.SAVE,
@@ -374,7 +472,19 @@ private fun LiquidCourseDialog(
                         .verticalScroll(rememberScrollState()),
                     verticalArrangement = Arrangement.spacedBy(10.dp)
                 ) {
-                if (editing) {
+                if (editingNotes) {
+                    // 备注表单：与修改课程共用同一张卡片、同一个 animateContentSize 动画，
+                    // 保存由头部右上角的对号按钮完成。
+                    CourseNotesEditor(
+                        bagNote = bagNote,
+                        examNote = examNote,
+                        customNote = customNote,
+                        keyboardRaised = keyboardRaised,
+                        onBagChange = { bagNote = it },
+                        onExamChange = { examNote = it },
+                        onCustomChange = { customNote = limitByHanWidth(it, CUSTOM_NOTE_MAX_LENGTH) }
+                    )
+                } else if (editing) {
                     CourseLiquidTextField(
                         label = "课程名",
                         value = courseName,
@@ -409,6 +519,14 @@ private fun LiquidCourseDialog(
                             }
                         )
                     }
+                    if (canEditNotes) {
+                        // 修改界面单独的备注入口：点击后弹出独立备注窗口。
+                        CourseNotesEntryButton(
+                            backdrop = backdrop,
+                            hasNotes = bagNote.isNotBlank() || examNote.isNotBlank() || customNote.isNotBlank(),
+                            onClick = { editingNotes = true }
+                        )
+                    }
                 } else {
                     CourseDetailLine(
                         label = "地点",
@@ -439,9 +557,177 @@ private fun LiquidCourseDialog(
                         secondaryColor = secondaryColor
                     )
                 }
+            }
+            }
+
+            // 备注覆盖在卡片右下角空白处：不占内容行、不影响卡片大小。
+            if (!editing && !editingNotes && canEditNotes && hasNotes) {
+                Box(
+                    Modifier
+                        .fillMaxWidth()
+                        .align(Alignment.BottomEnd)
+                        .padding(start = 24.dp, end = 20.dp, top = 30.dp, bottom = 18.dp)
+                        // 有备注时，点击备注区域直接进入备注编辑界面。
+                        .clickable(interactionSource = null, indication = null) {
+                            editingNotes = true
+                        }
+                ) {
+                    Column(
+                        Modifier.align(Alignment.BottomEnd),
+                        verticalArrangement = Arrangement.spacedBy(3.dp),
+                        horizontalAlignment = Alignment.End
+                    ) {
+                        if (bagNote.isNotBlank()) {
+                            BasicText(
+                                "手机袋：$bagNote",
+                                style = TextStyle(secondaryColor, 11.sp, FontWeight.Medium)
+                            )
+                        }
+                        if (examNote.isNotBlank()) {
+                            BasicText(
+                                "考试时间：$examNote",
+                                style = TextStyle(secondaryColor, 11.sp, FontWeight.Medium)
+                            )
+                        }
+                        if (customNote.isNotBlank()) {
+                            BasicText(
+                                customNote,
+                                style = TextStyle(secondaryColor, 11.sp, FontWeight.Medium)
+                            )
+                        }
+                    }
                 }
             }
+            // 卡片 Box 闭合。
+            }
         }
+    }
+}
+
+@Composable
+private fun CourseNotesEntryButton(
+    backdrop: com.kyant.backdrop.Backdrop,
+    hasNotes: Boolean,
+    onClick: () -> Unit
+) {
+    val animationScope = rememberCoroutineScope()
+    val interactiveHighlight = remember(animationScope) {
+        InteractiveHighlight(animationScope = animationScope)
+    }
+    val interactionSource = remember { MutableInteractionSource() }
+    val pressed by interactionSource.collectIsPressedAsState()
+    val scale by animateFloatAsState(
+        targetValue = if (pressed) 1.02f else 1f,
+        animationSpec = spring(dampingRatio = 0.62f, stiffness = 420f),
+        label = "courseNotesEntryScale"
+    )
+    val themeColors = CampusComposeTheme.colors
+    val contentColor = themeColors.primaryText
+    val shape = RoundedRectangle(16.dp)
+    Row(
+        Modifier
+            .fillMaxWidth()
+            .height(44.dp)
+            .graphicsLayer {
+                scaleX = scale
+                scaleY = scale
+            }
+            .drawBackdrop(
+                backdrop = backdrop,
+                shape = { shape },
+                effects = {
+                    vibrancy()
+                    colorControls(
+                        brightness = if (themeColors.isDark) 0f else 0.14f,
+                        saturation = if (themeColors.isDark) 0.54f else 0.84f
+                    )
+                    blur(8.dp.toPx())
+                    lens(12.dp.toPx(), 24.dp.toPx())
+                },
+                highlight = {
+                    Highlight.Default.copy(
+                        alpha = interactiveHighlight.pressProgress *
+                            if (themeColors.isDark) 0.18f else 0.68f
+                    )
+                },
+                onDrawSurface = {
+                    drawRect(
+                        if (themeColors.isDark) themeColors.glassStrongSurface
+                        else themeColors.glassSurface
+                    )
+                }
+            )
+            .border(
+                1.dp,
+                if (themeColors.isDark) Color.White.copy(alpha = 0.28f)
+                else Color.White.copy(alpha = 0.82f),
+                shape
+            )
+            .clip(shape)
+            .clickable(
+                interactionSource = interactionSource,
+                indication = null,
+                role = Role.Button,
+                onClick = onClick
+            )
+            .then(interactiveHighlight.modifier)
+            .then(interactiveHighlight.gestureModifier)
+            .padding(horizontal = 16.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        BasicText(
+            if (hasNotes) "修改备注" else "设置备注",
+            modifier = Modifier.weight(1f),
+            style = TextStyle(contentColor, 14.sp, FontWeight.Medium)
+        )
+        BasicText(
+            if (hasNotes) "已设置" else "未设置",
+            style = TextStyle(
+                contentColor.copy(alpha = 0.55f), 12.sp, FontWeight.Medium
+            )
+        )
+    }
+}
+
+@Composable
+private fun CourseNotesEditor(
+    bagNote: String,
+    examNote: String,
+    customNote: String,
+    keyboardRaised: Boolean,
+    onBagChange: (String) -> Unit,
+    onExamChange: (String) -> Unit,
+    onCustomChange: (String) -> Unit
+) {
+    Column(
+        Modifier.fillMaxWidth(),
+        verticalArrangement = Arrangement.spacedBy(10.dp)
+    ) {
+        CourseLiquidTextField(
+            label = "手机袋号码",
+            value = bagNote,
+            keyboardAlreadyVisible = keyboardRaised,
+            onValueChange = onBagChange,
+            fieldHeight = 68.dp
+        )
+        CourseLiquidTextField(
+            label = "考试时间",
+            value = examNote,
+            keyboardAlreadyVisible = keyboardRaised,
+            onValueChange = onExamChange,
+            fieldHeight = 68.dp
+        )
+        CourseLiquidTextField(
+            label = "自定义备注",
+            value = customNote,
+            keyboardAlreadyVisible = keyboardRaised,
+            onValueChange = { input ->
+                // 按显示宽度限制：最多 12 个汉字，字母/数字每 2 个算 1 个汉字，
+                // 超出部分直接输不进去。
+                onCustomChange(limitByHanWidth(input, CUSTOM_NOTE_MAX_LENGTH))
+            },
+            fieldHeight = 68.dp
+        )
     }
 }
 
@@ -483,15 +769,18 @@ private fun CourseLiquidTextField(
     label: String,
     value: String,
     keyboardAlreadyVisible: Boolean,
-    onValueChange: (String) -> Unit
+    onValueChange: (String) -> Unit,
+    fieldHeight: Dp = 58.dp
 ) {
     val themeColors = CampusComposeTheme.colors
     val contentColor = themeColors.primaryText
     val fieldShape = RoundedCornerShape(16.dp)
+    // 备注输入框略高，输入区域更宽松；课程编辑沿用默认高度。
+    val inputHeight = (fieldHeight - 30.dp).coerceAtLeast(28.dp)
     Column(
         Modifier
             .fillMaxWidth()
-            .height(58.dp)
+            .height(fieldHeight)
             // The dialog shell has already sampled and blurred the page. Sampling the
             // root backdrop again here would reveal a clearer copy of the original
             // timetable inside every field, so fields only tint the blurred shell.
@@ -529,7 +818,7 @@ private fun CourseLiquidTextField(
             },
             modifier = Modifier
                 .fillMaxWidth()
-                .height(28.dp)
+                .height(inputHeight)
                 .padding(top = 1.dp)
         )
     }
