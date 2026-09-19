@@ -27,6 +27,8 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.BlendMode
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
@@ -385,7 +387,19 @@ internal fun PageAlignedBackdropSource(
             .layerBackdrop(backdrop)
     ) {
         if (pageBackgroundImage == null) {
-            Box(Modifier.fillMaxSize().background(pageGradient))
+            // 渐变分支同样按整页窗口对齐绘制：如果按本组件（可能只是一个小选择器）
+            // 的尺寸画渐变，色标分布会与整页背景不一致，形成一块错色矩形。
+            Canvas(Modifier.fillMaxSize()) {
+                val viewportWidth = windowSize.width.takeIf { it > 0 } ?: size.width.roundToInt()
+                val viewportHeight = windowSize.height.takeIf { it > 0 } ?: size.height.roundToInt()
+                // 用整页同款渐变刷子，画在与整页窗口对齐的矩形上，
+                // 渐变几何与页面背景一致，消除错色矩形。
+                drawRect(
+                    brush = pageGradient,
+                    topLeft = Offset(-hostOffsetInWindow.x.toFloat(), -hostOffsetInWindow.y.toFloat()),
+                    size = Size(viewportWidth.toFloat(), viewportHeight.toFloat())
+                )
+            }
         } else if (sourceReady) {
             // Processed custom wallpapers can contain per-pixel alpha. Keep the same
             // default gradient underneath so every liquid surface samples exactly the

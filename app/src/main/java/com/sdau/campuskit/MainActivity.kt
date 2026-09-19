@@ -464,7 +464,7 @@ class MainActivity : ComponentActivity() {
         }
         CourseWidgetProvider.cancelLegacyNetworkRefresh(this)
         startPublicScheduleSyncIfNeeded(inferredCurrentTerm())
-        if (hasLocalCourseCache()) showSchedulePage() else showLoginPage(false)
+        if (hasLocalCourseCache()) showSchedulePage() else if (restoreLastPublicSchedule()) showSchedulePage() else showLoginPage(false)
         reminderBackgroundGuide.restoreState(state?.getBundle("reminder_background_guide"))
         checkForOnlineUpdate()
         window.decorView.post(::hideSystemNavigationBar)
@@ -1731,6 +1731,42 @@ class MainActivity : ComponentActivity() {
         showSchedulePage()
     }
 
+    /**
+     * 无个人课表登录记录时，用上次查询保存的全校课表选项（学院/年级/专业/班级）
+     * 直接进入全校课表。全部选项齐备且本地缓存可用才自动进入，否则返回 false
+     * 交给登录页。有个人课表登录记录时不会走到这里（启动优先个人课表）。
+     */
+    private fun restoreLastPublicSchedule(): Boolean {
+        val term = selectedTerm()
+        val college = savedPublicOption(KEY_PUBLIC_LAST_COLLEGE)
+        val grade = savedPublicOption(KEY_PUBLIC_LAST_GRADE)
+        val major = savedPublicOption(KEY_PUBLIC_LAST_MAJOR)
+        val className = savedPublicOption(KEY_PUBLIC_LAST_CLASS)
+        if (college.isBlank() || grade.isBlank() || major.isBlank() || className.isBlank()) return false
+        if (!hasPublicScheduleCache(term) || !hasPublicScheduleLookup(term)) return false
+        // 必须先恢复选择状态再查询：loadSelectedPublicScheduleCourses 用这四个字段作查询条件。
+        publicCollegeSelection = college
+        publicGradeSelection = grade
+        publicMajorSelection = major
+        publicClassSelection = className
+        loginUiState.resolvePublicSelection(college, grade, major, className)
+        val selected = loadSelectedPublicScheduleCourses(term)
+        if (selected.isEmpty()) {
+            loginUiState.resetPublicSelection()
+            publicCollegeSelection = ""
+            publicGradeSelection = ""
+            publicMajorSelection = ""
+            publicClassSelection = ""
+            return false
+        }
+        publicScheduleCourses = buildPublicScheduleCourses(selected, term)
+        publicScheduleTerm = term
+        publicScheduleLabel = "$college · $grade · $major · $className"
+        publicScheduleClassName = className
+        viewingPublicSchedule = true
+        return true
+    }
+
     private fun showLoginError(error: Exception) {
         val detail = error.message?.replace(Regex("\\s+"), " ")?.trim()
             ?.takeIf { it.isNotEmpty() }
@@ -2291,6 +2327,26 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun buildEmptyRoomSection(): View {
+        if (viewingPublicSchedule) {
+            // 全校课表模式下依赖个人账号的课表数据，与成绩/考试一致地展示不可用状态。
+            val scroll = ScrollView(this).apply {
+                isFillViewport = true
+                clipToPadding = false
+                overScrollMode = View.OVER_SCROLL_NEVER
+                setBackgroundColor(Color.TRANSPARENT)
+            }
+            val body = verticalLayout().apply { setPadding(dp(20), dp(18), dp(20), dp(28)) }
+            body.addView(text("空教室查询", 28f, scheduleTextPalette.primary, Typeface.BOLD).apply {
+                applyScheduleTextHalo()
+            }, spacedParams(dp(18)))
+            body.addView(buildAcademicEmptyState(
+                EmptyAcademicState.ROOMS,
+                "暂无空教室信息",
+                "此功能暂不可用\n请切换回个人账号重新查询"
+            ), LinearLayout.LayoutParams(-1, 0, 1f))
+            scroll.addView(body, FrameLayout.LayoutParams(-1, -1))
+            return scroll
+        }
         val visibleResult = emptyRoomResult?.takeIf {
             it.campus == emptyRoomCampus && it.week == emptyRoomWeek &&
                 it.weekday == emptyRoomWeekday && it.sectionCode == emptyRoomSectionCode
@@ -9934,7 +9990,9 @@ class MainActivity : ComponentActivity() {
                 allowDurationEdit = course.isCustom,
                 bagNote = course.bagNote,
                 examNote = course.examNote,
-                customNote = course.customNote.takeIf { course.customNoteWeek == currentWeek }.orEmpty(),
+                customNote = course.customNote
+                    .takeIf { course.customNoteWeek == -1 || course.customNoteWeek == currentWeek }
+                    .orEmpty(),
                 canEditNotes = !viewingPublicSchedule,
                 onSave = { name, room, teacher, weeks, slotCount ->
                     updateCourseCache(course, name, room, teacher, weeks, slotCount)
@@ -9945,7 +10003,8 @@ class MainActivity : ComponentActivity() {
                     // 原本无备注 → “备注已添加”，原本有备注 → “备注已修改”。
                     val hadNotes = course.bagNote.isNotBlank() ||
                         course.examNote.isNotBlank() ||
-                        (course.customNote.isNotBlank() && course.customNoteWeek == currentWeek)
+                        (course.customNote.isNotBlank() &&
+                            (course.customNoteWeek == -1 || course.customNoteWeek == currentWeek))
                     saveCourseNotes(course, bag, exam, custom)
                     val hasNotes = bag.isNotBlank() || exam.isNotBlank() || custom.isNotBlank()
                     if (hasNotes) {
@@ -10135,7 +10194,7 @@ class MainActivity : ComponentActivity() {
      * 保存课程备注。
      * 手机袋号码：每节课独立，仅同步“同名且同教室”的课程（同一门课在不同地点上课互不影响）；
      * 考试时间：课程级备注，同步到同名课程的所有周与节次；
-     * 自定义备注：只归属当前查看的那一周的那一节课。
+     * 自定义备注：同步到本节课（同名+同星期+同节次）的所有周，但不同步到其它节课。
      */
     private fun saveCourseNotes(original: Course, bag: String, exam: String, custom: String) {
         val source = if (original.isCustom) loadCustomCourseCache() else loadImportedCourseCache()
@@ -10147,13 +10206,14 @@ class MainActivity : ComponentActivity() {
                 // 手机袋号码：仅同名且同教室的课程才同步。
                 if (current.room == original.room) result = result.copy(bagNote = bag)
             }
-            // 自定义备注：仅当前周的本节课。这里必须独立判断，不能与上面的条件互斥，
-            // 否则同一门课修改手机袋号码时自定义备注会被跳过。
-            if (sameCourseRecord(current, original)) {
+            // 自定义备注：同一节课（同名+同星期+同节次，忽略周数）的所有周记录都同步，
+            // 不同周的同名同节次课视为同一门课；其它节课（即使同名）不受影响。
+            if (sameCourseInstance(current, original)) {
                 val limitedCustom = custom.take(12)
                 result = result.copy(
                     customNote = limitedCustom,
-                    customNoteWeek = if (limitedCustom.isNotBlank()) currentWeek else -1
+                    // -1：对所有周生效（自定义备注跟随本节课的每一周）。
+                    customNoteWeek = -1
                 )
             }
             result
@@ -10162,6 +10222,13 @@ class MainActivity : ComponentActivity() {
         if (original.isCustom) saveCustomCourseCache(recolored) else saveCourseCache(recolored)
         scheduleGrid?.setCourses(loadCourseCache())
     }
+
+    /** 同一节课的不同周记录：同名+同星期+同节次（忽略周数与教室差异）。 */
+    private fun sameCourseInstance(first: Course, second: Course): Boolean =
+        first.name == second.name &&
+            first.day == second.day &&
+            first.startSlot == second.startSlot &&
+            first.slotCount == second.slotCount
 
     private fun deleteCourseFromCache(course: Course) {
         if (viewingPublicSchedule) return

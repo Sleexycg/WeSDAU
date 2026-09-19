@@ -125,7 +125,12 @@ internal fun createScoreTermSelectorView(
         pageBackgroundBitmap?.asImageBitmap()
     }
     val pageGradient = Brush.linearGradient(themeColors.pageGradient)
-    Box {
+    Box(
+        Modifier
+            // 背景源图层必须随容器一起裁剪进胶囊形状：否则源矩形
+            // （渐变/scrim）会在玻璃胶囊之外露出，形成灰色矩形。
+            .clip(RoundedRectangle(14.dp))
+    ) {
         PageAlignedBackdropSource(
             backdrop = backdrop,
             pageBackgroundImage = pageBackgroundImage,
