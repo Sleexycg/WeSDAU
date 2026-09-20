@@ -118,8 +118,8 @@ WeSDAU 课程表是一款面向山东农业大学学生的 Android 校园工具�
 
 | 项目 | 当前值 |
 | --- | --- |
-| 当前版本 | `0.4.0` |
-| Version Code | `14` |
+| 当前版本 | `0.4.4` |
+| Version Code | `19` |
 | 最低系统 | Android 8.0（API 26） |
 | 开发语言 | Kotlin |
 | UI 技术 | Jetpack Compose / Canvas |

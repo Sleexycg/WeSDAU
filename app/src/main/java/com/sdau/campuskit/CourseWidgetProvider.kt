@@ -157,7 +157,19 @@ class CourseWidgetProvider : AppWidgetProvider() {
             val week = weekForDate(now, start)
             val courses = loadCourses(context)
             val occurrences = upcomingOccurrences(context, courses, start, now, courseLimit)
-            val headerMoment = if (!compact && occurrences.isNotEmpty()) occurrences.first().start else now
+            // 只展示右上角日期那一天的课程（occurrences 按时间排序，同一天连续）：
+            // 当天有课显示今天的；当天没课只显示下一次课所在那天的，
+            // 不再用更后面日期的课凑满行数。
+            val headerDayOffset = occurrences.firstOrNull()?.dayOffset
+            val display = if (headerDayOffset == null) emptyList()
+                else occurrences.takeWhile { it.dayOffset == headerDayOffset }
+            // 右上角日期规则（2x2/4x2 统一）：当天还有课显示今天；
+            // 当天没课则显示下一次课所在的日期。
+            val headerMoment = when {
+                display.isEmpty() -> now
+                display.first().dayOffset == 0 -> now
+                else -> display.first().start
+            }
             val headerWeek = weekForDate(headerMoment, start)
 
             views.setTextViewText(R.id.widget_header_date, SimpleDateFormat("M.d", Locale.CHINA).format(headerMoment.time))
@@ -182,9 +194,9 @@ class CourseWidgetProvider : AppWidgetProvider() {
                 views.setViewVisibility(R.id.widget_empty, View.GONE)
                 val availableRows = if (compact) 2 else COURSE_ROW_IDS.size
                 for (position in 0 until availableRows) {
-                    val visible = position < courseLimit && position < occurrences.size
+                    val visible = position < courseLimit && position < display.size
                     views.setViewVisibility(COURSE_ROW_IDS[position], if (visible) View.VISIBLE else View.GONE)
-                    if (visible) bindCourse(views, occurrences[position], position)
+                    if (visible) bindCourse(views, display[position], position)
                 }
             }
 
