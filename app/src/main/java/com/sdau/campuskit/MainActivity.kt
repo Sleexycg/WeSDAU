@@ -291,6 +291,10 @@ class MainActivity : ComponentActivity() {
     private var updateOverlay: View? = null
     private var announcementOverlay: LiquidAnnouncementDialogView? = null
     private var pendingAnnouncementInfo: String? = null
+    /** 公告配图 URL 列表（多张，弹窗内滑动切换）。 */
+    private var pendingAnnouncementImageUrls: List<String> = emptyList()
+    /** 与 pendingAnnouncementImageUrls 顺序配对的预加载位图（checkForOnlineUpdate 线程下载）。 */
+    private var pendingAnnouncementImages: List<Bitmap?> = emptyList()
     private var liquidToastOverlay: LiquidAppToastView? = null
     private var courseDragDeleteOverlay: LiquidCourseDeleteTargetView? = null
     private var courseDragSource: ScheduleGridView? = null
@@ -426,7 +430,9 @@ class MainActivity : ComponentActivity() {
         val url: String,
         val forceUpdate: Boolean = false,
         val announcementEnabled: Boolean = false,
-        val announcementInfo: String = ""
+        val announcementInfo: String = "",
+        /** 公告配图列表：tpinfo 支持多张（空白/逗号分隔），空列表表示无图。 */
+        val announcementImageUrls: List<String> = emptyList()
     )
     private data class PendingLiquidToast(
         val message: String,
@@ -477,12 +483,27 @@ class MainActivity : ComponentActivity() {
                 val preferences = getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
                 val shouldShowUpdate = update.code > currentVersionCode &&
                     (update.forceUpdate || preferences.getInt(KEY_UPDATE_STARTED_CODE, 0) < update.code)
-                val announcement = update.announcementInfo.trim().takeIf {
-                    update.announcementEnabled && it.isNotEmpty() &&
-                        preferences.getString(KEY_CONFIRMED_ANNOUNCEMENT, "") != it
+                val announcementImageUrls = update.announcementImageUrls
+                // 提前在后台线程下载全部公告配图，弹窗打开时直接展示，避免现场加载慢。
+                pendingAnnouncementImages = announcementImageUrls.map { url ->
+                    runCatching {
+                        val connection = (URL(url).openConnection() as HttpURLConnection).apply {
+                            connectTimeout = 5000; readTimeout = 5000; requestMethod = "GET"
+                        }
+                        connection.inputStream.use { BitmapFactory.decodeStream(it) }.also {
+                            connection.disconnect()
+                        }
+                    }.getOrNull()
+                }
+                // 公告有效条件：有文字或有配图（纯图片公告也弹）。
+                val announcement = (update.announcementInfo.trim().takeIf { it.isNotEmpty() }
+                    ?: announcementImageUrls.takeIf { it.isNotEmpty() }?.let { "" }).takeIf {
+                    update.announcementEnabled && it != null &&
+                        preferences.getString(KEY_CONFIRMED_ANNOUNCEMENT, "") != update.announcementInfo.trim()
                 }
                 runOnUiThread {
                     pendingAnnouncementInfo = announcement
+                    pendingAnnouncementImageUrls = announcementImageUrls
                     if (shouldShowUpdate) {
                         pendingApkUrl = update.url
                         showUpdateDialog(update)
@@ -520,6 +541,14 @@ class MainActivity : ComponentActivity() {
         }
         val announcementEnabled = json.optInt("ggkg", 0) != 0
         val announcementInfo = json.optString("gginfo", "")
+        // tpinfo 支持多张图片：JSON 数组，或用空格/逗号/换行分隔的多个 URL。
+        val announcementImageUrls = json.optJSONArray("tpinfo")?.let { items ->
+            (0 until items.length()).mapNotNull { items.optString(it).trim().takeIf(String::isNotEmpty) }
+        } ?: json.optString("tpinfo", "").trim()
+            .takeIf { it.isNotEmpty() }
+            ?.split(Regex("[\\s,，;；\\n]+"))
+            ?.mapNotNull { it.trim().takeIf(String::isNotEmpty) }
+            .orEmpty()
         return RemoteUpdate(
             code,
             name,
@@ -527,12 +556,15 @@ class MainActivity : ComponentActivity() {
             url,
             forceUpdate,
             announcementEnabled,
-            announcementInfo
+            announcementInfo,
+            announcementImageUrls
         )
     }
 
     private fun showPendingAnnouncement() {
-        val info = pendingAnnouncementInfo?.takeIf { it.isNotBlank() } ?: return
+        val info = pendingAnnouncementInfo?.takeIf { it.isNotBlank() }
+            ?: pendingAnnouncementImageUrls.takeIf { it.isNotEmpty() }?.let { "" }
+            ?: return
         if (updateOverlay != null || announcementOverlay != null || announcementDialogCapturePending) return
         announcementDialogCapturePending = true
         captureUpdateBackdrop { pageSnapshot ->
@@ -546,12 +578,16 @@ class MainActivity : ComponentActivity() {
                 context = this,
                 pageSnapshot = pageSnapshot,
                 announcement = info,
+                imageUrls = pendingAnnouncementImageUrls,
+                preloadedImages = pendingAnnouncementImages.takeIf { pendingAnnouncementImageUrls.isNotEmpty() } ?: emptyList(),
                 onCancel = { hideAnnouncementDialog() },
                 onConfirm = {
                     getSharedPreferences(PREFS_NAME, MODE_PRIVATE).edit()
                         .putString(KEY_CONFIRMED_ANNOUNCEMENT, info)
                         .apply()
                     pendingAnnouncementInfo = null
+                    pendingAnnouncementImageUrls = emptyList()
+                    pendingAnnouncementImages = emptyList()
                     hideAnnouncementDialog()
                 },
                 onOpenUrl = ::openAnnouncementUrl
