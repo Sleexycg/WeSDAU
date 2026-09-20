@@ -5694,7 +5694,8 @@ class MainActivity : ComponentActivity() {
         } else {
             courses.filter { courseVisibleOnScheduleDate(it, term, week) }
         }
-        buildExportCoursePlacements(visibleCourses).forEach { placement ->
+        val exportCourses = if (includeAllWeeks) mergeContiguousExportCourses(visibleCourses) else visibleCourses
+        buildExportCoursePlacements(exportCourses).forEach { placement ->
             val course = placement.course
             val start = course.startSlot / 2f
             val end = ((course.startSlot + course.slotCount).coerceAtMost(10)) / 2f
@@ -5752,6 +5753,60 @@ class MainActivity : ComponentActivity() {
             }
         }
         return bitmap
+    }
+
+    /**
+     * 整学期导出合并：名称、教师、地点、上课时间（星期+节次）完全一致，
+     * 且周数连贯（或重叠）的多条课程记录合并为一条，
+     * 例如 5-7 周 + 8-16 周 → 5-16 周，避免导出图重复卡片。
+     */
+    private fun mergeContiguousExportCourses(courses: List<Course>): List<Course> {
+        if (courses.size < 2) return courses
+        val rangeRegex = Regex("(\\d+)(?:\\s*-\\s*(\\d+))?")
+        fun parseWeeks(weeks: String): List<IntRange>? {
+            val normalized = weeks.replace("周", "").replace("—", "-").replace("至", "-")
+            val ranges = rangeRegex.findAll(normalized).mapNotNull { match ->
+                val first = match.groupValues[1].toIntOrNull() ?: return@mapNotNull null
+                val last = match.groupValues[2].toIntOrNull() ?: first
+                first..last
+            }.toList()
+            return ranges.ifEmpty { null }
+        }
+        fun formatWeeks(ranges: List<IntRange>): String = ranges.joinToString("、") { range ->
+            if (range.first == range.last) "${range.first}" else "${range.first}-${range.last}"
+        }
+        fun mergeRanges(ranges: List<IntRange>): List<IntRange> {
+            val sorted = ranges.sortedBy { it.first }
+            val result = mutableListOf<IntRange>()
+            for (range in sorted) {
+                val lastRange = result.lastOrNull()
+                if (lastRange != null && range.first <= lastRange.last + 1) {
+                    if (range.last > lastRange.last) {
+                        result[result.lastIndex] = lastRange.first..range.last
+                    }
+                } else {
+                    result += range
+                }
+            }
+            return result
+        }
+        return courses.groupBy {
+            // 名称/教师/地点/时间一致才可能合并；颜色取首条，备注不参与合并。
+            listOf(it.name, it.teacher, it.room, it.day, it.startSlot, it.slotCount)
+        }.flatMap { (_, group) ->
+            if (group.size < 2) {
+                group
+            } else {
+                val parsed = group.map { parseWeeks(it.weeks) }
+                if (parsed.any { it == null }) {
+                    // 周数缺失/无法解析的记录不参与合并，保持原样。
+                    group
+                } else {
+                    val merged = mergeRanges(parsed.filterNotNull().flatten())
+                    listOf(group.first().copy(weeks = formatWeeks(merged)))
+                }
+            }
+        }
     }
 
     private fun createCourseFiles(): Pair<File, File>? {

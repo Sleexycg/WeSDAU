@@ -36,30 +36,30 @@
             android:maxLines="1"
             android:text="8.20"
             android:textColor="@color/widget_header_text"
-            android:textSize="13dp" />
+            android:textSize="12dp" />
 
         <TextView
             android:id="@+id/widget_header_week"
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
-            android:layout_marginStart="10dp"
+            android:layout_marginStart="6dp"
             android:includeFontPadding="false"
             android:maxLines="1"
             android:text="第1周"
             android:textColor="@color/widget_header_text"
-            android:textSize="13dp" />
+            android:textSize="12dp" />
 
         <TextView
             android:id="@+id/widget_header_weekday"
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
-            android:layout_marginStart="10dp"
+            android:layout_marginStart="6dp"
             android:fontFamily="sans-serif-medium"
             android:includeFontPadding="false"
             android:maxLines="1"
             android:text="周四"
             android:textColor="@color/widget_weekday_text"
-            android:textSize="13dp" />
+            android:textSize="12dp" />
     </LinearLayout>
 
     <LinearLayout

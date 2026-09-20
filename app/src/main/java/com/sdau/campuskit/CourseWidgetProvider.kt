@@ -193,9 +193,20 @@ class CourseWidgetProvider : AppWidgetProvider() {
                 views.setViewVisibility(R.id.widget_courses, View.VISIBLE)
                 views.setViewVisibility(R.id.widget_empty, View.GONE)
                 val availableRows = if (compact) 2 else COURSE_ROW_IDS.size
+                val visibleCount = minOf(courseLimit, display.size)
+                // 至少保留两行的空间：单课时行高与两课时显示时一致（靠上、不居中、
+                // 不被压扁），超出的行才彻底移除。
+                val reservedRows = maxOf(2, visibleCount).coerceAtMost(availableRows)
                 for (position in 0 until availableRows) {
-                    val visible = position < courseLimit && position < display.size
-                    views.setViewVisibility(COURSE_ROW_IDS[position], if (visible) View.VISIBLE else View.GONE)
+                    val visible = position < visibleCount
+                    views.setViewVisibility(
+                        COURSE_ROW_IDS[position],
+                        when {
+                            visible -> View.VISIBLE
+                            position < reservedRows -> View.INVISIBLE
+                            else -> View.GONE
+                        }
+                    )
                     if (visible) bindCourse(views, display[position], position)
                 }
             }
