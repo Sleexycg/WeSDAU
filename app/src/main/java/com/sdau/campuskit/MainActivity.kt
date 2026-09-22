@@ -3760,6 +3760,7 @@ class MainActivity : ComponentActivity() {
             onRoomSelected = ::selectDormRoom,
             onEquipmentSelected = ::selectDormEquipment,
             onQuery = ::queryDormElectricity,
+            onLoadDailyPower = ::loadDormDailyPower,
             onRecharge = ::rechargeDormElectricity,
             onSaveRechargeQr = ::saveDormRechargeQrToGallery,
             onLoadRechargeHistory = ::loadDormRechargeHistory,
@@ -3809,6 +3810,7 @@ class MainActivity : ComponentActivity() {
 
     private fun clearDormResult(state: DormElectricityUiState) = state.copy(
         reading = null, lastQuery = null, error = null, rechargeQr = null, rechargeError = null,
+        dailyPower = null, dailyPowerError = null,
         rechargeHistory = emptyList(), historyLoading = false, historyError = null, historyHasMore = false
     )
 
@@ -3984,6 +3986,38 @@ class MainActivity : ComponentActivity() {
                     updateDormElectricityState { it.copy(reading = reading, lastQuery = lastQuery, loading = null, error = null) }
                 }.onFailure { error ->
                     updateDormElectricityState { it.copy(reading = null, loading = null, error = error.message ?: "剩余电量查询失败") }
+                }
+            }
+        }
+    }
+
+    /**
+     * Loaded when the daily list is opened. Reopening the same meter reuses the loaded window;
+     * changing room or line clears it through [clearDormResult].
+     */
+    private fun loadDormDailyPower() {
+        val page = dormElectricityOverlay ?: return
+        val meter = selectedDormMeter() ?: run {
+            updateDormElectricityState { it.copy(dailyPowerError = "请先选择校区、楼栋、房间和线路") }
+            return
+        }
+        if (dormElectricityState.loading == DormElectricityLoading.DAILY) return
+        if (dormElectricityState.dailyPower != null && dormElectricityState.dailyPowerError == null) return
+        val generation = ++dormElectricityRequestGeneration
+        updateDormElectricityState { it.copy(loading = DormElectricityLoading.DAILY, dailyPowerError = null) }
+        networkExecutor.execute {
+            val result = runCatching { dormElectricityRepository.queryDailyPower(meter) }
+            runOnUiThread {
+                if (generation != dormElectricityRequestGeneration || dormElectricityOverlay !== page ||
+                    selectedDormMeter() != meter) return@runOnUiThread
+                result.onSuccess { daily ->
+                    updateDormElectricityState {
+                        it.copy(dailyPower = daily, dailyPowerError = null, loading = null)
+                    }
+                }.onFailure { error ->
+                    updateDormElectricityState {
+                        it.copy(loading = null, dailyPowerError = error.message ?: "每日用电查询失败")
+                    }
                 }
             }
         }
@@ -4519,7 +4553,7 @@ class MainActivity : ComponentActivity() {
                 if (!viewingPublicSchedule) {
                     add(
                         LiquidMenuAction(
-                            title = if (pushEnabled) "关闭课程通知" else "开启课程通知",
+                            title = if (pushEnabled) "关闭课程提醒" else "开启课程提醒",
                             iconRes = if (pushEnabled) R.drawable.ic_push_on else R.drawable.ic_push_off,
                             isPushAction = true,
                             onClick = {

@@ -114,6 +114,14 @@ esac
 
 CLASSPATH=$APP_HOME/gradle/wrapper/gradle-wrapper.jar
 
+# Keep the Gradle home inside the project so the wrapper download, dependency cache, build cache
+# and configuration cache all survive between runs. Pointing this at build/ is wrong because
+# Gradle treats build/ as disposable output, which forces a cold start on every clean build.
+if [ -z "$GRADLE_USER_HOME" ] ; then
+    GRADLE_USER_HOME=$APP_HOME/.gradle-home
+    export GRADLE_USER_HOME
+fi
+
 
 # Determine the Java command to use to start the JVM.
 if [ -n "$JAVA_HOME" ] ; then

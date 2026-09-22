@@ -36,6 +36,11 @@ for %%i in ("%APP_HOME%") do set APP_HOME=%%~fi
 @rem Add default JVM options here. You can also use JAVA_OPTS and GRADLE_OPTS to pass JVM options to this script.
 set DEFAULT_JVM_OPTS="-Xmx64m" "-Xms64m"
 
+@rem Keep the Gradle home inside the project so the wrapper download, dependency cache, build cache
+@rem and configuration cache all survive between runs. Pointing this at build\ is wrong because
+@rem Gradle treats build\ as disposable output, which forces a cold start on every clean build.
+if not defined GRADLE_USER_HOME set "GRADLE_USER_HOME=%APP_HOME%.gradle-home"
+
 @rem Find java.exe
 if defined JAVA_HOME goto findJavaFromJavaHome
 

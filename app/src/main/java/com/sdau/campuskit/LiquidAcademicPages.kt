@@ -325,7 +325,10 @@ private fun EmptyRoomLiquidGroupCard(
                 onExpandedChanged(expanded)
             }
             Row(
-                Modifier.fillMaxWidth(),
+                // 预留搜索框的高度：展开时出现搜索框不再把标题和整行往下顶。
+                Modifier
+                    .fillMaxWidth()
+                    .heightIn(min = 38.dp),
                 verticalAlignment = Alignment.CenterVertically
             ) {
                 Row(

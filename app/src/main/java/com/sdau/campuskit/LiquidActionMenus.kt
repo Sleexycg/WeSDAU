@@ -200,7 +200,7 @@ internal class LiquidActionMenuView(
         val updatedRootActions = rootActions.map { action ->
             if (action.isPushAction) {
                 action.copy(
-                    title = if (enabled) "关闭课程通知" else "开启课程通知",
+                    title = if (enabled) "关闭课程提醒" else "开启课程提醒",
                     iconRes = if (enabled) R.drawable.ic_push_on else R.drawable.ic_push_off
                 )
             } else {

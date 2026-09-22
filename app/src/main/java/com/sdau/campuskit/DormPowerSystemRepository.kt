@@ -14,6 +14,22 @@ internal data class DormElectricityReading(
 ) {
     val remainingKwh: Double get() = paidKwh + freeKwh - arrearsKwh
 }
+
+/** One consumption day. [day] is the day the power was used (`sjdylday`), never the settlement day. */
+internal data class DormDailyPowerEntry(val day: LocalDate, val kwh: Double)
+
+internal data class DormDailyPower(
+    val days: List<DormDailyPowerEntry>,
+    val requestedDays: Int
+) {
+    /** Newest first. A day the school has no record for is absent, never reported as zero. */
+    val entries: List<DormDailyPowerEntry> get() = days.sortedByDescending { it.day }
+    val totalKwh: Double get() = days.sumOf { it.kwh }
+    /** Averaged over the days the school actually recorded, never over the requested window. */
+    val averageKwh: Double get() = if (days.isEmpty()) 0.0 else totalKwh / days.size
+    val hasData: Boolean get() = days.isNotEmpty()
+}
+
 internal data class DormRechargeQr(val imageBytes: ByteArray, val amount: Double, val orderId: String)
 internal data class DormRechargePayment(
     val paymentUrl: String, val amount: Double, val billingNumber: String, val orderId: String = ""
@@ -73,6 +89,9 @@ internal fun interface DormApiTransport {
     fun request(path: String, body: JSONObject?): JSONObject
 }
 
+/** The school's daily-power page only offers the most recent seven consumption days. */
+internal const val DORM_DAILY_POWER_DAYS = 7
+
 /** Uses the same student endpoints as the school's new TAND page; no administrator identity. */
 internal class DormElectricityRepository(
     private val transport: DormApiTransport = DormHttpTransport(),
@@ -112,6 +131,35 @@ internal class DormElectricityRepository(
             condition("dbday", today().toString()), condition("xiaoqu", meter.campus)
         ))))
         return DormElectricityParser.reading(json, meter)
+    }
+
+    /**
+     * The school caps the daily window at seven days and exposes no server-side aggregate, so the
+     * newest [days] consumption days are read as one inclusive range and summarised locally.
+     * A single-day range returns no rows, so [days] is always at least one full span.
+     */
+    fun queryDailyPower(meter: DormMeter, days: Int = DORM_DAILY_POWER_DAYS): DormDailyPower {
+        require(days in 1..DORM_DAILY_POWER_DAYS) { "每日用电仅支持最近 $DORM_DAILY_POWER_DAYS 天" }
+        val end = today()
+        val start = end.minusDays((days - 1).toLong())
+        val conditions = listOf(
+            condition("fangnumer", meter.billingNumber), condition("sjdylday", start.toString(), "gte"),
+            condition("sjdylday", end.toString(), "lte"), condition("xiaoqu", meter.campus)
+        )
+        val entries = linkedMapOf<LocalDate, DormDailyPowerEntry>()
+        var page = 1
+        while (true) {
+            val json = call("/webZndbbDayDate/search", searchBody(conditions, page, days, "sjdylday desc"))
+            val parsed = DormElectricityParser.dailyPower(json, meter)
+            parsed.forEach { entries[it.day] = it }
+            val data = json.optJSONObject("data") ?: error("供电系统未返回每日用电数据")
+            val hasMore = if (data.has("totalPage")) page < data.optInt("totalPage") else false
+            if (!hasMore || parsed.isEmpty()) break
+            check(page < 10_000) { "供电系统分页异常，请稍后重试" }
+            page++
+        }
+        return DormDailyPower(entries.values.filter { !it.day.isBefore(start) && !it.day.isAfter(end) }
+            .sortedBy { it.day }, days)
     }
 
     fun createRechargePayment(meter: DormMeter, lineLabel: String, amount: Double): DormRechargePayment {
@@ -211,6 +259,33 @@ internal object DormElectricityParser {
         return DormElectricityReading(number("payele"), number("freeele"), number("lossele"),
             row.optString("dbstatech").ifBlank { "状态未知" }, meter.location,
             row.optString("updatetime").takeUnless { it == "null" }.orEmpty())
+    }
+
+    /**
+     * The server filters the daily range on `sjdylday` only, so the room and line are re-checked
+     * here. `dayele` is a four-decimal string; an unparsable value fails loudly instead of
+     * becoming a fabricated 0 kWh day.
+     */
+    fun dailyPower(json: JSONObject, meter: DormMeter): List<DormDailyPowerEntry> {
+        val rows = json.optJSONObject("data")?.optJSONArray("records") ?: error("供电系统未返回每日用电数据")
+        val entries = (0 until rows.length()).mapNotNull { rows.optJSONObject(it) }.map { row ->
+            check(row.optString("fangnumer") == meter.billingNumber && row.optString("xiaoqu") == meter.campus) {
+                "每日用电数据与当前宿舍不匹配"
+            }
+            check(row.optString("xl").trim() == meter.line) { "每日用电数据与当前线路不匹配" }
+            val day = LocalDate.parse(
+                row.optString("sjdylday").trim().take(10),
+                java.time.format.DateTimeFormatter.ISO_LOCAL_DATE
+            )
+            val kwh = row.optString("dayele").trim().toDoubleOrNull()?.takeIf { it.isFinite() }
+                ?: error("供电系统返回的每日用电量异常")
+            check(kwh >= 0.0) { "供电系统返回的每日用电量异常" }
+            DormDailyPowerEntry(day, kwh)
+        }
+        // A repeated day would silently hide an earlier row, so collapse it loudly rather than pick one.
+        val duplicates = entries.groupingBy { it.day }.eachCount().filterValues { it > 1 }.keys
+        check(duplicates.isEmpty()) { "供电系统返回了重复的每日用电记录" }
+        return entries
     }
 
     fun history(json: JSONObject, meter: DormMeter, page: Int, pageSize: Int): DormRechargeHistoryPage {

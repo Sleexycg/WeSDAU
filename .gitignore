@@ -1,5 +1,6 @@
 # Gradle build outputs and caches
 .gradle/
+.gradle-home/
 **/build/
 build/
 
@@ -20,10 +21,12 @@ captures/
 lint/intermediates/
 
 # Packaged applications and mapping files
+*.apk
 *.aab
 *.ap_
 *.dex
 mapping.txt
+!docs/downloads/*.apk
 
 # Signing keys and private configuration
 *.jks

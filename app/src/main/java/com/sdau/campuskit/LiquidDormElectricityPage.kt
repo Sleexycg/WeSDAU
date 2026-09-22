@@ -93,11 +93,23 @@ private val DormRechargeDialogVerticalOffset = 48.dp
 private val DormRechargeDialogContentPadding = 20.dp
 private val DormRechargeDialogTitleTopPadding = 22.dp
 
+/** Bar geometry for the daily usage chart. */
+private val DormDailyBarWidth = 20.dp
+private val DormDailyBarMaxHeight = 92.dp
+private val DormDailyAxisHeight = 18.dp
+
+/**
+ * Lower bound used only to keep the daily power card from being pushed off-screen on a very short
+ * display. The card itself wraps its content, so no fixed content height is assumed.
+ */
+private val DormReadingMinHeight = 300.dp
+
 internal enum class DormElectricityLoading {
     CAMPUSES,
     BUILDINGS,
     ROOMS,
     QUERY,
+    DAILY,
     RECHARGE
 }
 
@@ -112,6 +124,8 @@ internal data class DormElectricityUiState(
     val equipment: DormElectricityOption? = null,
     val reading: DormElectricityReading? = null,
     val lastQuery: DormQuerySnapshot? = null,
+    val dailyPower: DormDailyPower? = null,
+    val dailyPowerError: String? = null,
     val rechargeQr: DormRechargeQr? = null,
     val rechargeError: String? = null,
     val rechargeHistory: List<DormRechargeHistoryEntry> = emptyList(),
@@ -134,6 +148,7 @@ internal class LiquidDormElectricityPageView(
     onRoomSelected: (DormElectricityOption) -> Unit,
     onEquipmentSelected: (DormElectricityOption) -> Unit,
     onQuery: () -> Unit,
+    onLoadDailyPower: () -> Unit,
     onRecharge: (Double) -> Unit,
     onSaveRechargeQr: () -> Unit,
     onLoadRechargeHistory: (Boolean) -> Unit,
@@ -164,6 +179,7 @@ internal class LiquidDormElectricityPageView(
                     onRoomSelected = onRoomSelected,
                     onEquipmentSelected = onEquipmentSelected,
                     onQuery = onQuery,
+                    onLoadDailyPower = onLoadDailyPower,
                     onRecharge = onRecharge,
                     onSaveRechargeQr = onSaveRechargeQr,
                     onLoadRechargeHistory = onLoadRechargeHistory,
@@ -204,6 +220,7 @@ private fun DormElectricityPage(
     onRoomSelected: (DormElectricityOption) -> Unit,
     onEquipmentSelected: (DormElectricityOption) -> Unit,
     onQuery: () -> Unit,
+    onLoadDailyPower: () -> Unit,
     onRecharge: (Double) -> Unit,
     onSaveRechargeQr: () -> Unit,
     onLoadRechargeHistory: (Boolean) -> Unit,
@@ -254,6 +271,15 @@ private fun DormElectricityPage(
             .coerceAtMost((maxHeight - formTop - 16.dp).coerceAtLeast(1.dp))
         val formCardModifier = Modifier.padding(horizontal = DormRechargeDialogHorizontalPadding)
             .offset(y = formTop).fillMaxWidth().height(formHeight)
+        // Daily power is measured rather than assumed: the card wraps its own content so it is never
+        // taller than the title, summary and chart need. It starts just below the balance card,
+        // which covers the dorm line (e.g. 泮河校区中央区-12号楼-623) without riding too high.
+        // wrapContentHeight keeps it exact; the heightIn max still bounds it on short screens.
+        val readingTop = (with(density) { resultBottom?.let { (it - rootTop).toDp() + 8.dp } } ?: top)
+            .coerceIn(16.dp, (maxHeight - DormReadingMinHeight - 16.dp).coerceAtLeast(16.dp))
+        val readingCardModifier = Modifier.padding(horizontal = DormRechargeDialogHorizontalPadding)
+            .offset(y = readingTop).fillMaxWidth()
+            .heightIn(max = (maxHeight - readingTop - 16.dp).coerceAtLeast(1.dp))
         // Anchor the compact amount card below the actual balance card, over the dorm title.
         val amountTop = (with(density) { resultBottom?.let { (it - rootTop).toDp() + 8.dp } } ?: top)
             .coerceIn(16.dp, (maxHeight - 260.dp - 16.dp).coerceAtLeast(16.dp))
@@ -278,7 +304,10 @@ private fun DormElectricityPage(
             item("dorm_result") {
                 Box(Modifier.onGloballyPositioned { resultBottom = it.boundsInRoot().bottom }) {
                     DormResultCard(backdrop, state, primary, secondary, shadow,
-                        onRecharge = { showRecharge = true }, onDetails = { showReadingDetails = true })
+                        onRecharge = { showRecharge = true }, onDetails = {
+                            showReadingDetails = true
+                            onLoadDailyPower()
+                        })
                 }
             }
             item("dorm_condition_title") {
@@ -461,8 +490,9 @@ private fun DormElectricityPage(
             enter = fadeIn() + scaleIn(initialScale = 0.96f),
             exit = fadeOut() + scaleOut(targetScale = 0.96f)
         ) {
-            state.reading?.let { reading ->
-                DormReadingDetailDialog(backdrop, reading, state.lastQuery, formCardModifier,
+            state.reading?.let {
+                DormReadingDetailDialog(backdrop, state.dailyPower,
+                    state.dailyPowerError, state.loading == DormElectricityLoading.DAILY, readingCardModifier,
                     primary, secondary, shadow) { showReadingDetails = false }
             }
         }
@@ -1324,9 +1354,10 @@ private fun DormRechargeHistoryDetailDialog(
 @Composable
 private fun DormReadingDetailDialog(
     backdrop: Backdrop,
-    reading: DormElectricityReading,
-    lastQuery: DormQuerySnapshot?,
-    formCardModifier: Modifier,
+    dailyPower: DormDailyPower?,
+    dailyPowerError: String?,
+    dailyLoading: Boolean,
+    cardModifier: Modifier,
     primary: Color,
     secondary: Color,
     shadow: Shadow?,
@@ -1337,7 +1368,7 @@ private fun DormReadingDetailDialog(
     Box(Modifier.fillMaxSize().clickable(interactionSource = null, indication = null, onClick = onDismiss),
         contentAlignment = Alignment.TopCenter) {
         Column(
-            formCardModifier
+            cardModifier
                 .drawBackdrop(
                     backdrop = backdrop,
                     shape = { RoundedRectangle(30.dp) },
@@ -1353,21 +1384,208 @@ private fun DormReadingDetailDialog(
                 .clip(RoundedCornerShape(30.dp))
                 .clickable(interactionSource = null, indication = null, onClick = {})
                 .padding(horizontal = 22.dp, vertical = 24.dp)
+                // The card wraps its content, so this only engages on screens too short to fit the
+                // chart; there the axis scrolls into view instead of being clipped.
                 .verticalScroll(rememberScrollState()),
-            verticalArrangement = Arrangement.spacedBy(24.dp)
+            verticalArrangement = Arrangement.spacedBy(16.dp)
         ) {
             Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-                androidx.compose.foundation.text.BasicText("电量明细", Modifier.weight(1f),
+                androidx.compose.foundation.text.BasicText("每日用电", Modifier.weight(1f),
                     style = TextStyle(primary, 24.sp, FontWeight.ExtraBold, shadow = shadow))
             }
-            DormReadingDetailRow("免费电量", String.format(Locale.US, "%.2f kWh", reading.freeKwh), primary, secondary, shadow)
-            DormReadingDetailRow("付费电量", String.format(Locale.US, "%.2f kWh", reading.paidKwh), primary, secondary, shadow)
-            DormReadingDetailRow("欠费电量", String.format(Locale.US, "%.2f kWh", reading.arrearsKwh), primary, secondary, shadow)
-            DormReadingDetailRow("上次查询日期", lastQuery?.let {
-                java.text.SimpleDateFormat("yyyy-MM-dd HH:mm", Locale.CHINA).format(java.util.Date(it.queriedAt))
-            } ?: "暂无查询记录", primary, secondary, shadow)
-            DormReadingDetailRow("上次查询电量", lastQuery?.let { String.format(Locale.US, "%.2f kWh", it.remainingKwh) }
-                ?: "暂无查询记录", primary, secondary, shadow)
+            DormDailyPowerSection(dailyPower, dailyPowerError, dailyLoading, primary, secondary, shadow, theme)
+        }
+    }
+}
+
+/** Only days the school actually recorded are listed; days without a record are simply absent. */
+@Composable
+private fun DormDailyPowerSection(
+    dailyPower: DormDailyPower?,
+    error: String?,
+    loading: Boolean,
+    primary: Color,
+    secondary: Color,
+    shadow: Shadow?,
+    theme: CampusComposeColors
+) {
+    when {
+        loading && dailyPower == null -> {
+            Box(Modifier.fillMaxWidth().height(96.dp), contentAlignment = Alignment.Center) { DormSpinner() }
+        }
+        error != null && dailyPower == null -> {
+            Column(
+                Modifier.fillMaxWidth()
+                    .clip(RoundedCornerShape(20.dp))
+                    .background(theme.glassSurface.copy(alpha = 0.76f))
+                    .border(1.dp, dormOutlineColor(theme.isDark), RoundedCornerShape(20.dp))
+                    .padding(horizontal = 16.dp, vertical = 18.dp),
+                horizontalAlignment = Alignment.CenterHorizontally,
+                verticalArrangement = Arrangement.spacedBy(4.dp)
+            ) {
+                androidx.compose.foundation.text.BasicText("每日用电获取失败",
+                    style = TextStyle(theme.error, 15.sp, FontWeight.Bold, shadow = shadow))
+                androidx.compose.foundation.text.BasicText(error,
+                    style = TextStyle(secondary, 13.sp, FontWeight.Medium, shadow = shadow))
+            }
+        }
+        dailyPower == null || !dailyPower.hasData -> {
+            Box(
+                Modifier.fillMaxWidth()
+                    .clip(RoundedCornerShape(20.dp))
+                    .background(theme.glassSurface.copy(alpha = 0.76f))
+                    .border(1.dp, dormOutlineColor(theme.isDark), RoundedCornerShape(20.dp))
+                    .padding(horizontal = 16.dp, vertical = 30.dp),
+                contentAlignment = Alignment.Center
+            ) {
+                androidx.compose.foundation.text.BasicText(
+                    error ?: "最近 ${dailyPower?.requestedDays ?: DORM_DAILY_POWER_DAYS} 天没有用电记录",
+                    style = TextStyle(secondary, 14.sp, FontWeight.Medium, shadow = shadow))
+            }
+        }
+        else -> {
+            Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                DormDailyPowerSummary(dailyPower, primary, secondary, shadow, theme)
+                // Bars are scaled against the busiest recorded day, so the shape of usage is
+                // readable at a glance without adding a chart dependency.
+                DormDailyPowerChart(dailyPower, secondary, shadow, theme)
+            }
+        }
+    }
+}
+
+/** Total and daily average, with the recorded-day count that both numbers are based on. */
+@Composable
+private fun DormDailyPowerSummary(
+    dailyPower: DormDailyPower,
+    primary: Color,
+    secondary: Color,
+    shadow: Shadow?,
+    theme: CampusComposeColors
+) {
+    Column(
+        Modifier.fillMaxWidth()
+            .clip(RoundedCornerShape(20.dp))
+            .background(theme.glassSurface.copy(alpha = 0.76f))
+            .border(1.dp, dormOutlineColor(theme.isDark), RoundedCornerShape(20.dp))
+            .padding(horizontal = 16.dp, vertical = 14.dp),
+        verticalArrangement = Arrangement.spacedBy(10.dp)
+    ) {
+        Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.Bottom) {
+            Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                androidx.compose.foundation.text.BasicText("合计",
+                    style = TextStyle(secondary, 12.sp, FontWeight.SemiBold, shadow = shadow))
+                Row(verticalAlignment = Alignment.Bottom) {
+                    androidx.compose.foundation.text.BasicText(
+                        String.format(Locale.US, "%.2f", dailyPower.totalKwh),
+                        maxLines = 1,
+                        autoSize = TextAutoSize.StepBased(18.sp, 28.sp, 1.sp),
+                        style = TextStyle(theme.accent, 28.sp, FontWeight.ExtraBold, shadow = shadow))
+                    Spacer(Modifier.width(3.dp))
+                    androidx.compose.foundation.text.BasicText("kWh",
+                        modifier = Modifier.padding(bottom = 3.dp),
+                        style = TextStyle(secondary, 12.sp, FontWeight.SemiBold, shadow = shadow))
+                }
+            }
+            Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp),
+                horizontalAlignment = Alignment.End) {
+                androidx.compose.foundation.text.BasicText("日均",
+                    style = TextStyle(secondary, 12.sp, FontWeight.SemiBold, shadow = shadow))
+                androidx.compose.foundation.text.BasicText(
+                    String.format(Locale.US, "%.2f", dailyPower.averageKwh),
+                    maxLines = 1,
+                    autoSize = TextAutoSize.StepBased(18.sp, 28.sp, 1.sp),
+                    style = TextStyle(primary, 28.sp, FontWeight.ExtraBold, shadow = shadow))
+            }
+        }
+    }
+}
+
+/**
+ * One vertical bar per recorded day, oldest on the left, with the value above each bar. Bars share
+ * the full card width evenly, so a short window spreads out instead of clustering on the left.
+ */
+@Composable
+private fun DormDailyPowerChart(
+    dailyPower: DormDailyPower,
+    secondary: Color,
+    shadow: Shadow?,
+    theme: CampusComposeColors
+) {
+    // Oldest first so time reads left to right, matching the axis labels underneath.
+    val days = dailyPower.entries.reversed()
+    // Guard the division: a peak of 0 would otherwise make every bar height NaN.
+    val peakKwh = days.maxOf { it.kwh }
+    Column(
+        Modifier.fillMaxWidth()
+            .clip(RoundedCornerShape(20.dp))
+            .background(theme.glassSurface.copy(alpha = 0.76f))
+            .border(1.dp, dormOutlineColor(theme.isDark), RoundedCornerShape(20.dp))
+            .padding(horizontal = 14.dp, vertical = 14.dp),
+        verticalArrangement = Arrangement.spacedBy(8.dp)
+    ) {
+        Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+            androidx.compose.foundation.text.BasicText("每日用电量",
+                modifier = Modifier.weight(1f),
+                style = TextStyle(secondary, 12.sp, FontWeight.SemiBold, shadow = shadow))
+            androidx.compose.foundation.text.BasicText("单位 kWh",
+                style = TextStyle(secondary.copy(alpha = 0.8f), 11.sp, FontWeight.Medium, shadow = shadow))
+        }
+        // One equal-weight column per day keeps the bars evenly spread across the full width
+        // whether the school recorded five days or seven.
+        Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.Bottom) {
+            for (entry in days) {
+                Box(Modifier.weight(1f), contentAlignment = Alignment.Center) {
+                    DormDailyPowerBar(entry, peakKwh, secondary, shadow, theme)
+                }
+            }
+        }
+        // Date axis sits under the plot area, aligned to the same equal-width columns as the bars.
+        // A fixed height keeps the labels from being squeezed away when the card is tight.
+        Row(Modifier.fillMaxWidth().height(DormDailyAxisHeight), verticalAlignment = Alignment.CenterVertically) {
+            for (entry in days) {
+                Box(Modifier.weight(1f), contentAlignment = Alignment.Center) {
+                    androidx.compose.foundation.text.BasicText(
+                        entry.day.format(java.time.format.DateTimeFormatter.ofPattern("MM-dd")),
+                        maxLines = 1,
+                        softWrap = false,
+                        autoSize = TextAutoSize.StepBased(8.sp, 11.sp, 0.5.sp),
+                        style = TextStyle(secondary, 11.sp, FontWeight.Medium, shadow = shadow))
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun DormDailyPowerBar(
+    entry: DormDailyPowerEntry,
+    peakKwh: Double,
+    secondary: Color,
+    shadow: Shadow?,
+    theme: CampusComposeColors
+) {
+    val fraction = if (peakKwh > 0.0) (entry.kwh / peakKwh).toFloat().coerceIn(0f, 1f) else 0f
+    val isBusiest = peakKwh > 0.0 && entry.kwh >= peakKwh
+    Column(
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.spacedBy(4.dp)
+    ) {
+        androidx.compose.foundation.text.BasicText(
+            String.format(Locale.US, "%.2f", entry.kwh),
+            maxLines = 1,
+            autoSize = TextAutoSize.StepBased(8.sp, 11.sp, 0.5.sp),
+            style = TextStyle(if (isBusiest) theme.accent else secondary,
+                11.sp, FontWeight.Bold, shadow = shadow))
+        // Every bar is drawn inside the same fixed-height box, so short days stay visually
+        // comparable to tall ones regardless of how many days are present.
+        Box(Modifier.height(DormDailyBarMaxHeight), contentAlignment = Alignment.BottomCenter) {
+            Box(
+                Modifier.width(DormDailyBarWidth)
+                    .height((DormDailyBarMaxHeight * fraction).coerceAtLeast(3.dp))
+                    .clip(RoundedCornerShape(topStart = 5.dp, topEnd = 5.dp))
+                    .background(if (isBusiest) theme.accent else theme.accent.copy(alpha = 0.62f))
+            )
         }
     }
 }
