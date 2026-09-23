@@ -241,6 +241,8 @@ class MainActivity : ComponentActivity() {
     private var detailOverlay: LiquidCourseDialogView? = null
     private var scoreTermOverlay: LiquidScoreTermDropdownView? = null
     private var scoreReminderOverlay: LiquidScoreReminderDialogView? = null
+    private var scoreIntervalOverlay: LiquidPickerDialogView? = null
+    private var scoreIntervalCapturePending = false
     private val scoreTermSelectorExpanded = mutableStateOf(false)
     private var scoreDetailOverlay: LiquidScoreDetailDialogView? = null
     private var trainingPlanOverlay: LiquidTrainingPlanPageView? = null
@@ -355,6 +357,8 @@ class MainActivity : ComponentActivity() {
     private var courseDragChromeOwner: LiquidCourseDeleteTargetView? = null
     private var radialChromeAnimationGeneration = 0
     private val scoreUpdatesEnabled = mutableStateOf(false)
+    private val scoreUpdateIntervalMinutes = mutableStateOf(ScoreUpdateSchedulePolicy.DEFAULT_INTERVAL_MINUTES)
+    private val scoreUpdateIntervalChoices = listOf(10, 15, 30, 60, 120, 180, 360)
     private var scoresLoading = false
     private var scoreExporting = false
     private var scheduleExporting = false
@@ -459,6 +463,7 @@ class MainActivity : ComponentActivity() {
         CourseReminderScheduler.restore(this)
         ScoreUpdateScheduler.restoreIfEnabled(this)
         scoreUpdatesEnabled.value = ScoreUpdateScheduler.isEnabled(this)
+        scoreUpdateIntervalMinutes.value = ScoreUpdateScheduler.intervalMinutes(this)
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
             window.setDecorFitsSystemWindows(true)
         }
@@ -1002,6 +1007,9 @@ class MainActivity : ComponentActivity() {
         scoreReminderOverlay?.releaseSnapshot()
         scoreReminderOverlay = null
         scoreReminderCapturePending = false
+        scoreIntervalOverlay?.releaseSnapshot()
+        scoreIntervalOverlay = null
+        scoreIntervalCapturePending = false
         scoreDetailOverlay?.releaseSnapshot()
         scoreDetailOverlay = null
         emptyRoomFilterOverlay?.releaseSnapshot()
@@ -3653,8 +3661,10 @@ class MainActivity : ComponentActivity() {
                 context = this,
                 pageSnapshot = pageSnapshot,
                 enabled = scoreUpdatesEnabled,
+                intervalMinutes = scoreUpdateIntervalMinutes,
                 statusProvider = { ScoreUpdateScheduler.queryStatus(this) },
                 onToggle = ::setScoreUpdateMonitoringEnabled,
+                onIntervalClick = ::showScoreUpdateIntervalPicker,
                 onDismiss = ::hideScoreReminderDialog
             )
             pageHost.addView(dialog, matchParentParams())
@@ -3676,6 +3686,63 @@ class MainActivity : ComponentActivity() {
             if (scoreReminderOverlay === overlay) scoreReminderOverlay = null
             afterDismiss?.invoke()
         }.start()
+    }
+
+    private fun showScoreUpdateIntervalPicker() {
+        if (scoreIntervalOverlay != null || scoreIntervalCapturePending) return
+        scoreIntervalCapturePending = true
+        captureUpdateBackdrop { pageSnapshot ->
+            scoreIntervalCapturePending = false
+            if (isFinishing || isDestroyed || scoreIntervalOverlay != null) {
+                pageSnapshot?.takeUnless(Bitmap::isRecycled)?.recycle()
+                return@captureUpdateBackdrop
+            }
+            val dialog = LiquidPickerDialogView(
+                context = this,
+                pageSnapshot = pageSnapshot,
+                title = "检查频率",
+                options = scoreUpdateIntervalChoices.map { minutes ->
+                    LiquidPickerOption(
+                        title = scoreUpdateIntervalLabel(minutes),
+                        subtitle = if (minutes == ScoreUpdateSchedulePolicy.MIN_INTERVAL_MINUTES) {
+                            "系统支持的最快频率"
+                        } else "",
+                        selected = minutes == scoreUpdateIntervalMinutes.value,
+                        onClick = {
+                            hideScoreUpdateIntervalPicker()
+                            applyScoreUpdateInterval(minutes)
+                        }
+                    )
+                },
+                highFrost = true,
+                onDismiss = ::hideScoreUpdateIntervalPicker
+            )
+            pageHost.addView(dialog, matchParentParams())
+            scoreIntervalOverlay = dialog
+            dialog.alpha = 0f
+            dialog.animate().alpha(1f).setDuration(180L).start()
+        }
+    }
+
+    private fun hideScoreUpdateIntervalPicker() {
+        val overlay = scoreIntervalOverlay ?: return
+        overlay.animate().alpha(0f).setDuration(130L).withEndAction {
+            pageHost.removeView(overlay)
+            overlay.releaseSnapshot()
+            if (scoreIntervalOverlay === overlay) scoreIntervalOverlay = null
+        }.start()
+    }
+
+    private fun applyScoreUpdateInterval(minutes: Int) {
+        val previous = scoreUpdateIntervalMinutes.value
+        val applied = ScoreUpdateScheduler.setIntervalMinutes(this, minutes)
+        scoreUpdateIntervalMinutes.value = applied
+        if (applied == previous) return
+        showLiquidToast(
+            message = "已切换为${scoreUpdateIntervalLabel(applied)}检查一次",
+            visual = LiquidToastVisual.SUCCESS,
+            durationMillis = 2_200L
+        )
     }
 
     private fun buildScheduleHeader(): View {
@@ -7878,6 +7945,10 @@ class MainActivity : ComponentActivity() {
             hideAppearanceDialog()
             return
         }
+        if (scoreIntervalOverlay != null) {
+            hideScoreUpdateIntervalPicker()
+            return
+        }
         if (scoreReminderOverlay != null) {
             hideScoreReminderDialog()
             return
@@ -10576,6 +10647,9 @@ class MainActivity : ComponentActivity() {
         gradeExamOverlay = null
         scoreReminderOverlay?.releaseSnapshot()
         scoreReminderOverlay = null
+        scoreIntervalOverlay?.releaseSnapshot()
+        scoreIntervalOverlay = null
+        scoreIntervalCapturePending = false
         detailOverlay?.releaseSnapshot()
         detailOverlay = null
         emptyRoomFilterOverlay?.releaseSnapshot()

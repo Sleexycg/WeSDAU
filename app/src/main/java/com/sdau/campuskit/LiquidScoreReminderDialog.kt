@@ -53,8 +53,10 @@ internal class LiquidScoreReminderDialogView(
     context: Context,
     private var pageSnapshot: Bitmap?,
     enabled: State<Boolean>,
+    intervalMinutes: State<Int>,
     statusProvider: () -> ScoreUpdateQueryStatus,
     onToggle: (Boolean) -> Unit,
+    onIntervalClick: () -> Unit,
     onDismiss: () -> Unit
 ) : FrameLayout(context) {
     init {
@@ -65,8 +67,10 @@ internal class LiquidScoreReminderDialogView(
                 LiquidScoreReminderDialog(
                     pageSnapshot = pageSnapshot,
                     enabled = enabled,
+                    intervalMinutes = intervalMinutes,
                     statusProvider = statusProvider,
                     onToggle = onToggle,
+                    onIntervalClick = onIntervalClick,
                     onDismiss = onDismiss
                 )
             },
@@ -79,12 +83,18 @@ internal class LiquidScoreReminderDialogView(
     }
 }
 
+/** Shared by the reminder dialog row and the interval picker options. */
+internal fun scoreUpdateIntervalLabel(minutes: Int): String =
+    if (minutes >= 60 && minutes % 60 == 0) "每 ${minutes / 60} 小时" else "每 $minutes 分钟"
+
 @Composable
 private fun LiquidScoreReminderDialog(
     pageSnapshot: Bitmap?,
     enabled: State<Boolean>,
+    intervalMinutes: State<Int>,
     statusProvider: () -> ScoreUpdateQueryStatus,
     onToggle: (Boolean) -> Unit,
+    onIntervalClick: () -> Unit,
     onDismiss: () -> Unit
 ) {
     val themeColors = CampusComposeTheme.colors
@@ -163,7 +173,7 @@ private fun LiquidScoreReminderDialog(
                 style = TextStyle(themeColors.primaryText, 22.sp, FontWeight.Bold)
             )
             BasicText(
-                "开启后每 30 分钟检查一次是否发布新成绩",
+                "开启后自动在后台检查是否发布新成绩",
                 style = TextStyle(themeColors.secondaryText, 13.sp, FontWeight.Normal)
             )
 
@@ -181,11 +191,25 @@ private fun LiquidScoreReminderDialog(
                         "成绩更新提醒",
                         style = TextStyle(themeColors.primaryText, 15.sp, FontWeight.Medium)
                     )
-                    BasicText(
-                        if (enabled.value) "已开启" else "已关闭",
-                        modifier = Modifier.padding(top = 3.dp),
-                        style = TextStyle(themeColors.secondaryText, 12.sp, FontWeight.Normal)
-                    )
+                    Row(
+                        Modifier.padding(top = 3.dp),
+                        horizontalArrangement = Arrangement.spacedBy(4.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        BasicText(
+                            if (enabled.value) "已开启 ·" else "已关闭 ·",
+                            style = TextStyle(themeColors.secondaryText, 12.sp, FontWeight.Normal)
+                        )
+                        BasicText(
+                            "${scoreUpdateIntervalLabel(intervalMinutes.value)} ›",
+                            modifier = Modifier.clickable(
+                                interactionSource = null,
+                                indication = null,
+                                onClick = onIntervalClick
+                            ),
+                            style = TextStyle(themeColors.accent, 12.sp, FontWeight.SemiBold)
+                        )
+                    }
                 }
                 LiquidSettingsToggle(
                     selected = { enabled.value },

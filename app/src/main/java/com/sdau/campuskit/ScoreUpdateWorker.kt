@@ -196,6 +196,7 @@ internal object ScoreUpdateScheduler {
     private const val KEY_NEXT_ALARM_ELAPSED = "score_update_monitor_next_alarm_elapsed"
     private const val KEY_ALARM_BOOT = "score_update_monitor_alarm_boot"
     private const val KEY_SESSION = "score_update_monitor_session"
+    private const val KEY_INTERVAL_MINUTES = "score_update_monitor_interval_minutes"
     private const val CHECK_WORK = "score_update_monitor_check"
     private const val WATCHDOG_WORK = "score_update_monitor_watchdog"
     private const val REPAIR_WORK = "score_update_monitor_repair"
@@ -203,10 +204,7 @@ internal object ScoreUpdateScheduler {
     private const val LEGACY_INITIAL_WORK = "score_update_monitor_initial"
     private const val LEGACY_PERIODIC_WORK = "score_update_monitor_periodic"
     private const val ALARM_REQUEST_CODE = 4203
-    private const val CHECK_INTERVAL_MILLIS = 30L * 60L * 1_000L
     private const val WATCHDOG_INTERVAL_HOURS = 6L
-    private const val SUCCESS_STALE_MILLIS = 90L * 60L * 1_000L
-    private const val FOREGROUND_CATCH_UP_MILLIS = 45L * 60L * 1_000L
     private val enqueueExecutor = Executors.newSingleThreadExecutor()
 
     fun session(context: Context): String = context.getSharedPreferences(APP_PREFS, Context.MODE_PRIVATE)
@@ -222,6 +220,34 @@ internal object ScoreUpdateScheduler {
     fun isEnabled(context: Context): Boolean =
         context.getSharedPreferences(APP_PREFS, Context.MODE_PRIVATE)
             .getBoolean(KEY_ENABLED, false)
+
+    fun intervalMinutes(context: Context): Int =
+        ScoreUpdateSchedulePolicy.clampIntervalMinutes(
+            context.getSharedPreferences(APP_PREFS, Context.MODE_PRIVATE)
+                .getInt(KEY_INTERVAL_MINUTES, ScoreUpdateSchedulePolicy.DEFAULT_INTERVAL_MINUTES)
+        )
+
+    private fun intervalMillis(context: Context): Long =
+        ScoreUpdateSchedulePolicy.intervalMillis(intervalMinutes(context))
+
+    /** Returns the applied (clamped) interval. A running monitor restarts its cadence. */
+    @Synchronized
+    fun setIntervalMinutes(context: Context, minutes: Int): Int {
+        val appContext = context.applicationContext
+        val applied = ScoreUpdateSchedulePolicy.clampIntervalMinutes(minutes)
+        appContext.getSharedPreferences(APP_PREFS, Context.MODE_PRIVATE)
+            .edit()
+            .putInt(KEY_INTERVAL_MINUTES, applied)
+            .apply()
+        ScoreUpdateDiagnostics.record(appContext, "interval_changed", "minutes=$applied")
+        if (isEnabled(appContext)) {
+            cancelAlarm(appContext)
+            if (!scheduleNextAlarm(appContext, ScoreUpdateSchedulePolicy.intervalMillis(applied))) {
+                scheduleRepair(appContext)
+            }
+        }
+        return applied
+    }
 
     fun queryStatus(context: Context): ScoreUpdateQueryStatus {
         val preferences = context.getSharedPreferences(APP_PREFS, Context.MODE_PRIVATE)
@@ -326,13 +352,14 @@ internal object ScoreUpdateScheduler {
         if (forceAlarm || missing || remaining <= 0L) {
             // Re-register future alarms at their original deadline, including
             // alarms only a few seconds away. Never postpone them on resume.
-            if (!scheduleNextAlarm(appContext, remaining.takeIf { it > 0L } ?: CHECK_INTERVAL_MILLIS)) {
+            if (!scheduleNextAlarm(appContext, remaining.takeIf { it > 0L } ?: intervalMillis(appContext))) {
                 scheduleRepair(appContext)
             }
         }
 
         val lastCheckAt = preferences.getLong(KEY_LAST_CHECK_AT, 0L)
-        if (remaining <= 0L || lastCheckAt == 0L || now - lastCheckAt >= FOREGROUND_CATCH_UP_MILLIS) {
+        val catchUpMillis = ScoreUpdateSchedulePolicy.foregroundCatchUpMillis(intervalMinutes(appContext))
+        if (remaining <= 0L || lastCheckAt == 0L || now - lastCheckAt >= catchUpMillis) {
             enqueueCheck(appContext, "restore")
         } else {
             // Upgrade a legacy normal pending request even when no catch-up is due.
@@ -371,12 +398,13 @@ internal object ScoreUpdateScheduler {
             PendingIntent.FLAG_NO_CREATE
         ) != null
         val repaired = if (!hasAlarmToken || remaining <= 0L) {
-            scheduleNextAlarm(appContext, remaining.takeIf { it > 0L } ?: CHECK_INTERVAL_MILLIS)
+            scheduleNextAlarm(appContext, remaining.takeIf { it > 0L } ?: intervalMillis(appContext))
         } else true
 
         val lastCheckAt = preferences.getLong(KEY_LAST_CHECK_AT, 0L)
+        val staleMillis = ScoreUpdateSchedulePolicy.successStaleMillis(intervalMinutes(appContext))
         return try {
-            if (remaining <= 0L || lastCheckAt == 0L || now - lastCheckAt >= SUCCESS_STALE_MILLIS) {
+            if (remaining <= 0L || lastCheckAt == 0L || now - lastCheckAt >= staleMillis) {
                 enqueueCheck(appContext, "watchdog").get(8, TimeUnit.SECONDS)
             } else {
                 enqueueCheck(appContext, "migration", onlyExisting = true).get(8, TimeUnit.SECONDS)
@@ -462,10 +490,12 @@ internal object ScoreUpdateScheduler {
     }
 
     @Synchronized
-    private fun scheduleNextAlarm(context: Context, delayMillis: Long = CHECK_INTERVAL_MILLIS): Boolean {
+    private fun scheduleNextAlarm(context: Context, delayMillis: Long = 0L): Boolean {
         if (!isEnabled(context) || !canScheduleExactAlarms(context)) return false
         val alarmManager = context.getSystemService(Context.ALARM_SERVICE) as AlarmManager
-        val delay = delayMillis.coerceIn(1_000L, CHECK_INTERVAL_MILLIS)
+        val intervalMillis = ScoreUpdateSchedulePolicy.intervalMillis(intervalMinutes(context))
+        val delay = (if (delayMillis > 0L) delayMillis else intervalMillis)
+            .coerceIn(1_000L, intervalMillis)
         val triggerElapsed = SystemClock.elapsedRealtime() + delay
         return runCatching {
             alarmManager.setExactAndAllowWhileIdle(
@@ -639,7 +669,7 @@ internal object ScoreUpdateNotification {
                     "成绩更新提醒",
                     NotificationManager.IMPORTANCE_DEFAULT
                 ).apply {
-                    description = "每 30 分钟检查是否发布了新成绩"
+                    description = "每 ${ScoreUpdateScheduler.intervalMinutes(context)} 分钟检查是否发布了新成绩"
                     setShowBadge(true)
                     lockscreenVisibility = android.app.Notification.VISIBILITY_PUBLIC
                 }
