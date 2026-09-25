@@ -8648,18 +8648,16 @@ class MainActivity : ComponentActivity() {
 
     private inner class ScheduleGridView(context: Context, private var courses: List<Course>) : View(context) {
         private val dayNames = arrayOf("一", "二", "三", "四", "五", "六", "日")
-        private val springTimes = arrayOf(
-            arrayOf("08:00", "08:50"), arrayOf("09:00", "09:50"), arrayOf("10:10", "11:00"),
-            arrayOf("10:55", "11:40"), arrayOf("14:00", "14:45"), arrayOf("14:55", "15:40"),
-            arrayOf("16:00", "16:45"), arrayOf("16:55", "17:40"), arrayOf("19:00", "19:45"),
-            arrayOf("19:55", "20:40")
-        )
-        private val summerTimes = arrayOf(
-            arrayOf("08:00", "08:45"), arrayOf("08:55", "09:40"), arrayOf("10:00", "10:45"),
-            arrayOf("10:55", "11:40"), arrayOf("14:30", "15:15"), arrayOf("15:25", "16:10"),
-            arrayOf("16:30", "17:15"), arrayOf("17:25", "18:10"), arrayOf("19:30", "20:15"),
-            arrayOf("20:25", "21:10")
-        )
+        private val springTimes = slotTimeLabels(ScheduleMode.SPRING)
+        private val summerTimes = slotTimeLabels(ScheduleMode.SUMMER)
+
+        private fun slotTimeLabels(mode: ScheduleMode): Array<Array<String>> =
+            ScheduleTimePolicy.timeRanges(mode).map { (start, end) ->
+                arrayOf(slotTimeLabel(start), slotTimeLabel(end))
+            }.toTypedArray()
+
+        private fun slotTimeLabel(minutes: Int): String = "%02d:%02d".format(minutes / 60, minutes % 60)
+
         private val paint = Paint(Paint.ANTI_ALIAS_FLAG)
         private val rect = RectF()
         private var weekIndex = 1

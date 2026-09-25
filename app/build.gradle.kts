@@ -21,8 +21,8 @@ android {
         applicationId = "com.sdau.campuskit"
         minSdk = 26
         targetSdk = 34
-        versionCode = 19
-        versionName = "0.4.4"
+        versionCode = 20
+        versionName = "0.4.5"
         androidResources.localeFilters += arrayOf("zh", "en")
     }
 
